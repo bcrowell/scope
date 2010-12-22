@@ -12,6 +12,16 @@ use Gtk2 -init;
 use IO::File;
 use Audio::OSS qw(:formats);
 use Time::HiRes;
+use Math::FFT;
+
+my $small_buff_size_log2 = 9;
+my $small_buff_size = (1<<$small_buff_size_log2);
+my $n_small_buffs_log2 = 1;
+my $n_small_buffs = (1<<$n_small_buffs_log2); # making this bigger makes fft (logarithmically) slower, but increases frequency resolution
+my $big_buff_size = (1<<($n_small_buffs_log2+$small_buff_size_log2));
+
+my $sample_size_bytes = 2; # 2 or 4
+my $mode = 'f'; # can be 'f' (frequency) or 't' (time)
 
 # -----------------------------------------------------------------------------------------------------------------
 #          data shared between threads
@@ -30,6 +40,9 @@ $collect_sound_thread = threads->create(\&collect_sound) or die "error creating 
 #          global data related to GUI
 # -----------------------------------------------------------------------------------------------------------------
 my ($window,$area,$pixmap,%allocated_colors,$gc,$colormap);
+my @big_buff = (0) x $big_buff_size; # preallocate it for efficiency
+my $first_valid_small = 0;
+my $n_valid_smalls = 0;
 # -----------------------------------------------------------------------------------------------------------------
 #          create, run, and destroy GUI
 # -----------------------------------------------------------------------------------------------------------------
@@ -42,10 +55,11 @@ my $event_source_tag = Glib::Idle->add(
       $fresh_data = 0;
       draw();
     }
-    return 1; # don't automatically remove this callback
+    return 1; # 1 means don't automatically remove this callback
   }
 ); 
 Gtk2->main;
+$time_to_die = 1;
 Glib::Source->remove($event_source_tag);
 $collect_sound_thread->join();
 if ($collect_sound_error) {die $collect_sound_error}
@@ -58,10 +72,14 @@ sub collect_sound {
   my $buff;
   my ($dsp,$error) = open_sound_input();
   if ($error) {$collect_sound_error = $error; return undef}
-  while(read($dsp,$buff,1024) && !$time_to_die) {
+  my $template;
+  if ($sample_size_bytes==2) {$template = "n$small_buff_size"}
+  if ($sample_size_bytes==4) {$template = "N$small_buff_size"}
+  if (!defined $template) {$collect_sound_error = "illegal sample size, $sample_size_bytes bytes"; return undef}
+  while(read($dsp,$buff,$small_buff_size*$sample_size_bytes) && !$time_to_die) {
     {
       lock(@sound_data);
-      @sound_data = unpack("n1024",$buff);
+      @sound_data = unpack($template,$buff);
       $fresh_data = 1;
     }
   }
@@ -77,20 +95,70 @@ sub draw {
     lock(@sound_data);
     @copy_of_sound_data = @sound_data;
   }
- 
+
+  put_new_data_in_circular_buffer();
+  return if $mode eq 'f' && $n_valid_smalls<$n_small_buffs;
+
   # get current window size and freeze it, so x y scaling is constant in the pixmap
   my (undef, undef, $width0, $height0, undef) = $window->window->get_geometry;
   $window->set_size_request($width0,$height0);
   $window->set_resizable(0);
 
-  my ($w,$h); # width and height
-  (undef, undef, $w, $h, undef) = $area->window->get_geometry;
-
   my $colormap = $pixmap->get_colormap;
   my $gc = $pixmap->{gc} || new Gtk2::Gdk::GC $pixmap;
+  my ($w,$h);
+  (undef, undef, $w, $h, undef) = $area->window->get_geometry;
 
+  # clear the window
   $gc->set_foreground(get_color($colormap, 'white'));
   $pixmap->draw_rectangle($gc,1,0,0,$w,$h); # x,y,w,h
+
+  if ($mode eq 't') {draw_time_mode($colormap,$gc,$w,$h)}
+  if ($mode eq 'f') {draw_freq_mode($colormap,$gc,$w,$h)}
+
+  #without this line the screen won't be updated until a screen action
+  $area->queue_draw;                                                      
+}
+
+sub draw_freq_mode {
+  my ($colormap,$gc,$w,$h) = @_; #w=width, h=height
+ 
+  my $fft = Math::FFT->new(\@big_buff);
+  my $spectrum = $fft->spctrm(); # has $big_buff_size+1 elements
+
+  my $x_shift = 1;
+  while (($big_buff_size<<$x_shift)<$w/2) {++$x_shift}
+  $x_shift += 3;
+
+  my $scale = sub {
+    use integer;
+    my ($x,$y) = @_;
+    return ($x<<$x_shift,$h-($y>>9)-10);
+  };
+
+  $gc->set_foreground(get_color($colormap, 'black'));
+
+  my ($prev_x,$prev_y) = &$scale(0,0);
+  my $k=0;
+  foreach my $power(@$spectrum) {
+    my ($x,$y) = &$scale($k,$power);
+    $pixmap->draw_line($gc, $prev_x,$prev_y, $x,$y);
+    last if $x>$w;
+    ($prev_x,$prev_y) =($x,$y);
+    ++$k;
+  }
+
+  $first_valid_small = 0;
+  $n_valid_smalls = 0;
+}
+
+sub draw_time_mode {
+  my ($colormap,$gc,$w,$h) = @_; #w=width, h=height
+
+  my $i1 = $first_valid_small*$small_buff_size;
+  my $n_samples = $n_valid_smalls*$small_buff_size;
+  my $i2 = ($i1 + $n_samples-1)%$big_buff_size;
+
   my $half_height = int($h/2);
 
   $gc->set_foreground(get_color($colormap, 'black'));
@@ -105,30 +173,46 @@ sub draw {
   my $dc_filter_window_log2 = 4;
   my $dc_filter_window = 1<<$dc_filter_window_log2;
   my $dc_level = 0;
-  for (my $i=0; $i<$dc_filter_window; $i++) {
-    $dc_level += $copy_of_sound_data[0];
+  for (my $i=$i1; $i<$i1+$dc_filter_window; $i++) {
+    $dc_level += $big_buff[$i];
   }
 
-  my $i = 0;
-  my ($prev_x,$prev_y) = &$scale(0,$copy_of_sound_data[0]-$dc_level);
-  foreach my $sample(@copy_of_sound_data) {
-    my $j = $i-1-$dc_filter_window;
-    if ($j>=0) {
-      $dc_level += ($copy_of_sound_data[$j+$dc_filter_window]-$copy_of_sound_data[$j]);
+  my $i = $i1;
+  my $j = ($i1-$dc_filter_window)%$big_buff_size;
+  my ($prev_x,$prev_y) = &$scale(0,$big_buff[$i1]-$dc_level);
+  for (my $k=0 ; $k<$n_samples; $k++) {
+    my $sample = $big_buff[$i];
+    if ($k>= $dc_filter_window) {
+      $dc_level += ($sample-$big_buff[$j]);
     }
-    my ($x,$y) = &$scale($i,$sample-($dc_level>>$dc_filter_window_log2));
+    my ($x,$y) = &$scale($k,$sample-($dc_level>>$dc_filter_window_log2));
     # draw as a staircase (presumably vertical and horizontal lines are implemented more efficiently)
-    if ($i>0) {
+    if ($k>0) {
       $pixmap->draw_line($gc, $prev_x,$prev_y, $x,$prev_y);
       $pixmap->draw_line($gc, $x,$prev_y, $x,$y);
-      #$pixmap->draw_line($gc, $prev_x,$half_height, $x,$half_height);
+      last if $x>$w;
     }
     ($prev_x,$prev_y) = ($x,$y);
     $i++;
+    $j++;
+    if ($i>=$big_buff_size) {$i -= $big_buff_size}
+    if ($j>=$big_buff_size) {$j -= $big_buff_size}
   }
+  $first_valid_small = ($first_valid_small+$n_valid_smalls)%$n_small_buffs;
+  $n_valid_smalls = 0;
 
-  #without this line the screen won't be updated until a screen action
-  $area->queue_draw;                                                      
+}
+
+sub put_new_data_in_circular_buffer {
+  # Splice the newly collected small buffer into the large circular buffer.
+  my $k=($first_valid_small+$n_valid_smalls)%$n_small_buffs;
+  #print "splicing, big_buff=",(0+@big_buff)," copy_of_sound_data=",(0+@copy_of_sound_data),"\n";
+  splice @big_buff,$k*$small_buff_size,$small_buff_size,@copy_of_sound_data;
+  ++$n_valid_smalls;
+  if ($n_valid_smalls>$n_small_buffs) { # circular buffer has overflowed
+    $n_valid_smalls = $n_small_buffs;
+    $first_valid_small = ($first_valid_small+1)%$n_small_buffs
+  }
 }
 
 sub get_color {
@@ -168,9 +252,6 @@ sub configure_event {
 
    $gc       = Gtk2::Gdk::GC->new( $pixmap );
    $colormap = $pixmap->get_colormap;
-
-# set a default foreground
-   $gc->set_foreground( get_color( $colormap, 'red' ) );
 
    return TRUE;
 }
@@ -237,12 +318,7 @@ sub open_sound_input {
 # -----------------------------------------------------------------------------------------------------------------
 #          GUI setup
 # -----------------------------------------------------------------------------------------------------------------
-# gtk2 pixmaps (on linux ?) have a current limit 
-# of short unsigned INT , highest pixels is 
-# 32767 is (8bit int max) -1     
 sub gui_setup {
-my $xsize = 2400; # maxsize = 32767
-my $ysize = 100;
 
 $pixmap     = undef;
 $gc         = undef;
@@ -255,7 +331,7 @@ my ($x0,$y0,$x1,$y1,$width,) = (0,0,0,0);
 $window = new Gtk2::Window ( "toplevel" );
 $window->signal_connect ("delete_event", sub { $time_to_die = 1; Gtk2->main_quit; });
 $window->set_border_width (10);
-$window->set_size_request(640,480);
+$window->set_size_request(1024+28,480); # oscilloscope area comes out 1024 pixels wide on my system
 $window->set_position('center');
 
 my $vbox = Gtk2::VBox->new( 0, 0 );
@@ -264,7 +340,6 @@ $vbox->set_border_width(2);
 
 my $hbox = Gtk2::HBox->new( 0, 0 );
 $vbox->pack_start($hbox,1,1,0);
-$hbox->set_size_request(320,240);
 $hbox->set_border_width(2);
 
 my $hbox1 = Gtk2::HBox->new( 0, 0 );
@@ -277,7 +352,6 @@ $button1->signal_connect( clicked => \&draw);
 
 # Create the drawing area.
 $area = new Gtk2::DrawingArea; #don't confuse with Gtk2::Drawable
-$area->size ($xsize, $ysize);
 $hbox->pack_start($area,1,1,0);
 
 $area->set_events ([qw/exposure-mask
