@@ -10,18 +10,32 @@ use threads::shared;
 use Glib qw/TRUE FALSE/;
 use Gtk2 -init;
 use IO::File;
-use Audio::OSS qw(:formats);
 use Time::HiRes;
 use Math::FFT;
 
+# The following are from Audio::OSS's Constants.pm, which is constructed by its Makefile.PL by compiling a C program that #includes soundfile.h.
+# This works on intel (little-endian). I think these might have to be swapped to work on ARM (which can be either little- or big-endian).
+my %dsp_constant = (
+    SNDCTL_DSP_RESET => 0x00005000 ,
+    SNDCTL_DSP_SYNC => 0x00005001 ,
+    SNDCTL_DSP_CHANNELS => 0xc0045006 ,
+    SNDCTL_DSP_GETFMTS => 0x8004500b ,
+    SNDCTL_DSP_SETFMT => 0xc0045005,
+    SNDCTL_DSP_SPEED => 0xc0045002,
+    AFMT_S16_BE => 0x00000020 ,
+);
+
 my $small_buff_size_log2 = 9;
 my $small_buff_size = (1<<$small_buff_size_log2);
-my $n_small_buffs_log2 = 1;
-my $n_small_buffs = (1<<$n_small_buffs_log2); # making this bigger makes fft (logarithmically) slower, but increases frequency resolution
+my $n_small_buffs_log2 = 2;  # making this bigger makes fft (logarithmically) slower, but increases frequency resolution
+my $n_small_buffs = (1<<$n_small_buffs_log2);
 my $big_buff_size = (1<<($n_small_buffs_log2+$small_buff_size_log2));
 
+my $sampling_rate = 48000; # request most common native rate; this may get changed based on what the sound card actually is willing to set itself to
 my $sample_size_bytes = 2; # 2 or 4
 my $mode = 'f'; # can be 'f' (frequency) or 't' (time)
+
+print "small_buff_size=$small_buff_size   n_small_buffs=$n_small_buffs    big_buff_size=$big_buff_size\n";
 
 # -----------------------------------------------------------------------------------------------------------------
 #          data shared between threads
@@ -70,7 +84,8 @@ exit(0);
 sub collect_sound {
   my @data;
   my $buff;
-  my ($dsp,$error) = open_sound_input();
+  my ($dsp,$error) = open_sound_input($sampling_rate);
+  print "actual sampling rate=$sampling_rate\n";
   if ($error) {$collect_sound_error = $error; return undef}
   my $template;
   if ($sample_size_bytes==2) {$template = "n$small_buff_size"}
@@ -128,12 +143,13 @@ sub draw_freq_mode {
 
   my $x_shift = 1;
   while (($big_buff_size<<$x_shift)<$w/2) {++$x_shift}
-  $x_shift += 3;
+
+  #print "x_shift=$x_shift   top_frequency=",int(($sampling_rate/2)*($w<<$x_shift)/$big_buff_size)," Hz, one channel=",(($sampling_rate/2)/$big_buff_size)," Hz \n";
 
   my $scale = sub {
     use integer;
     my ($x,$y) = @_;
-    return ($x<<$x_shift,$h-($y>>9)-10);
+    return ($x<<$x_shift,$h-($y>>7));
   };
 
   $gc->set_foreground(get_color($colormap, 'black'));
@@ -142,7 +158,9 @@ sub draw_freq_mode {
   my $k=0;
   foreach my $power(@$spectrum) {
     my ($x,$y) = &$scale($k,$power);
-    $pixmap->draw_line($gc, $prev_x,$prev_y, $x,$y);
+    if ($k>2) {
+      $pixmap->draw_rectangle($gc,1,$prev_x,$prev_y,($x-$prev_x),($h-$prev_y));
+    }
     last if $x>$w;
     ($prev_x,$prev_y) =($x,$y);
     ++$k;
@@ -280,20 +298,22 @@ sub close_sound_input {
 }
 
 sub open_sound_input {
+  no strict 'subs';
 
-  my $sampling_rate_desired = 48000;
+  my $sampling_rate_desired = 48000; # default
   if (@_) {$sampling_rate_desired = shift}
 
   my $dsp = new IO::File("</dev/dsp") or return(undef,"open failed: $!");
 
-  Audio::OSS::dsp_reset($dsp) or return(undef,"reset failed: $!");
+  dsp_reset($dsp) or return(undef,"reset failed: $!");
 
   #--- format
 
-  my $mask = Audio::OSS::get_supported_fmts($dsp);
-  my $format_desired = AFMT_S16_BE; # 16 bits, NE=native, LE=little-endian, BE=big-endian
+  my $mask = get_supported_fmts($dsp);
+  my $format_desired;
+  $format_desired = $dsp_constant{AFMT_S16_BE}; # 16 bits, NE=native, LE=little-endian, BE=big-endian
   if ($mask & $format_desired) {
-    Audio::OSS::set_fmt($dsp, $format_desired) or return(undef,"set format failed: $!");
+    set_fmt($dsp, $format_desired) or return(undef,"set format failed: $!");
   }
   else {
     return(undef,"desired format not available in set_fmt");
@@ -301,19 +321,46 @@ sub open_sound_input {
 
   #--- sampling rate
 
-  my $sampling_rate_actual = Audio::OSS::set_sps($dsp, $sampling_rate_desired);
-  $sampling_rate_actual eq $sampling_rate_desired or return(undef,"sampling rate set to $sampling_rate_actual rather than $sampling_rate_desired");
+  my $sampling_rate = set_sps($dsp, $sampling_rate_desired); # May change the global variable by, e.g., 10 %. This is normal http://manuals.opensound.com/developer/SNDCTL_DSP_SPEED.html
 
- #--- mono
+  #--- mono
      
   my $channels = pack "L",1;
   my $was = $channels;
-  # The hex below is SNDCTL_DSP_CHANNELS.
-  ioctl $dsp, 0xc0045006, $channels or return(undef,"error setting mono, $!");
-  #$was eq $channels or return(undef,"error setting mono, result not as requested");
+  ioctl $dsp, $dsp_constant{SNDCTL_DSP_CHANNELS}, $channels or return(undef,"error setting mono, $!");
 
   return ($dsp,0);
 
+}
+
+sub dsp_reset {
+    my $dsp = shift;
+    ioctl $dsp, $dsp_constant{SNDCTL_DSP_SYNC}, 0 or return undef;
+    ioctl $dsp, $dsp_constant{SNDCTL_DSP_RESET}, 0;
+}
+
+sub get_supported_fmts {
+  my ($fh,$in) = @_;
+  do_ioctl($fh,$in,$dsp_constant{SNDCTL_DSP_GETFMTS});
+}
+
+sub set_fmt {
+  my ($fh,$in) = @_;
+  do_ioctl($fh,$in,$dsp_constant{SNDCTL_DSP_SETFMT});
+}
+
+sub set_sps {
+  my ($fh,$in) = @_;
+  do_ioctl($fh,$in,$dsp_constant{SNDCTL_DSP_SPEED});
+}
+
+sub do_ioctl {
+  my $fh = shift;
+  my $in = shift || 0;
+  my $ioctl = shift;
+  my $out = pack "L", $in;
+  ioctl($fh, $ioctl, $out) or return undef;
+  return unpack "L", $out;
 }
 # -----------------------------------------------------------------------------------------------------------------
 #          GUI setup
@@ -374,25 +421,4 @@ $window->show_all;
 sub warning {
   my $message = shift;
   print STDERR $message,"\n";
-}
-
-sub wait_for_flag {
-  my $who = shift;
-  my $name_of_flag = shift;
-  my $flag_ref = shift;
-  my $desired = shift; # 0 or 1
-  my $max_sleep = shift; # milliseconds
-
-  my $ms_slept = 0;
-  my $this_sleep = 1; # milliseconds
-  while ($$flag_ref != $desired) {
-    Time::HiRes::usleep(1000*$this_sleep); # microseconds=1000*milliseconds
-    $ms_slept += $this_sleep;
-    if ($this_sleep<100) {$this_sleep = $this_sleep * 2}
-    if ($ms_slept>$max_sleep) {
-      warning("in $who, $name_of_flag was set for $ms_slept milliseconds, which is greater than $max_sleep");
-      return 0;
-    }
-  }
-  return 1;
 }
