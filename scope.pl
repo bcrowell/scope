@@ -5,8 +5,6 @@
 
 use warnings;
 use strict;
-use threads;
-use threads::shared;
 use Glib qw/TRUE FALSE/;
 use Gtk2 -init;
 use IO::File;
@@ -30,36 +28,29 @@ my %dsp_constant = (
 # In frequency mode:
 #   $big_buff_size is also the size of the fft frame.
 #   We can average the complex amplitudes over $moving_average_length frames.
-#   The defaults are $big_buff_size=8192, $moving_average_length=64. These were the defaults in fftexplorer, where they worked well.
+#   The defaults are $big_buff_size=8192, $moving_average_length=64. 
+#   In fftexplorer, these are the defaults (if averaging is turned on).
 
-my $small_buff_size_log2 = 9;       # normally 9
-my $n_small_buffs_log2 = 2;         # normally 4; making this bigger makes fft (logarithmically) slower, but increases frequency resolution
+my $small_buff_size_log2 = 9;       # normally 9; if too small, may get bogged down by gtk events
+                                    # In my current implementation of time mode, this also affects how long a trace can be.
+my $n_small_buffs_log2 = 4;         # normally 4; making this bigger makes fft (logarithmically) slower, but increases frequency resolution
                                     # making this >=4 causes long delays between callbacks to draw()??
-my $moving_average_length_log2 = 4; # normally 6
+my $moving_average_length_log2 = 0; # normally 6
 
 my $small_buff_size = (1<<$small_buff_size_log2);
 my $n_small_buffs = (1<<$n_small_buffs_log2);
 my $big_buff_size = (1<<($n_small_buffs_log2+$small_buff_size_log2));
 my $moving_average_length = (1<<$moving_average_length_log2);
 
-my $sampling_rate = 48000; # request most common native rate; this may get changed based on what the sound card actually is willing to set itself to
+my $desired_sampling_rate = 48000; # request most common native rate; this may get changed based on what the sound card actually is willing to set itself to
 my $sample_size_bytes = 2; # only 2 works
 my $mode = 'f'; # can be 'f' (frequency) or 't' (time)
 
-print "small_buff_size=$small_buff_size   n_small_buffs=$n_small_buffs    big_buff_size=$big_buff_size    moving_average_length=$moving_average_length\n";
 
 # -----------------------------------------------------------------------------------------------------------------
 #          data shared between threads
 # -----------------------------------------------------------------------------------------------------------------
-my ($time_to_die,$collect_sound_error,$fresh_data,@sound_data) :shared;
-$time_to_die = 0;
-$fresh_data = 0;
-
-# -----------------------------------------------------------------------------------------------------------------
-#          create sound-reading thread
-# -----------------------------------------------------------------------------------------------------------------
-my $collect_sound_thread;
-$collect_sound_thread = threads->create(\&collect_sound) or die "error creating thread, $!";
+my @sound_data;
 
 # -----------------------------------------------------------------------------------------------------------------
 #          global data related to GUI
@@ -72,66 +63,69 @@ my @fft_frames = (); # array of refs to fft's (complex amplitudes); a FIFO buffe
 my @fft_running_sum = (0) x ($big_buff_size); # the current sum of the spectra in fft_frames
 
 # -----------------------------------------------------------------------------------------------------------------
+#          open sound input
+# -----------------------------------------------------------------------------------------------------------------
+my ($dsp,$error,$sampling_rate) = open_sound_input($desired_sampling_rate);
+print "actual sampling rate=$sampling_rate, dsp fileno=",fileno($dsp),"\n";
+if ($error) {die "error opening sound input, $error"}
+
+print "small_buff_size=$small_buff_size   n_small_buffs=$n_small_buffs    big_buff_size=$big_buff_size    moving_average_length=$moving_average_length\n";
+print "reads will happen every ",((1./$sampling_rate)*$small_buff_size)," s,",
+      " fft frame filled once every ",((1./$sampling_rate)*$small_buff_size)*$n_small_buffs," s",
+      " time to refresh moving average is ",((1./$sampling_rate)*$small_buff_size)*$n_small_buffs*$moving_average_length," s",
+      "\n";
+
+# -----------------------------------------------------------------------------------------------------------------
 #          create, run, and destroy GUI
 # -----------------------------------------------------------------------------------------------------------------
-my @copy_of_sound_data;
 gui_setup();
-my $redraw_callback = sub {
-  if ($fresh_data) {
-    $fresh_data = 0;
-    draw();
+my $event_source_tag;
+my $count = 0;
+STDOUT->autoflush(1);
+my $busy_drawing = 0;
+$event_source_tag = Glib::IO->add_watch(
+  fileno($dsp),
+  'in',
+  sub {
+    my $err = collect_sound();
+    if ($err!=0) {die $err}
+    if (!$busy_drawing) {$busy_drawing=1; draw(); $busy_drawing=0}
+    return 1;
   }
-  return 1; # 1 means don't automatically remove this callback
-};
-# The following could possibly be done more efficiently by using g_io_add_watch_full().
-my $event_source_tag = Glib::Idle->add(
-  $redraw_callback,
-  undef,
-  #Glib::G_PRIORITY_DEFAULT
-  #Glib::G_PRIORITY_HIGH_IDLE
-); 
+);
 Gtk2->main;
-$time_to_die = 1;
-Glib::Source->remove($event_source_tag);
-$collect_sound_thread->join();
-if ($collect_sound_error) {die $collect_sound_error}
+turn_off_sound_input();
 exit(0);
 # -----------------------------------------------------------------------------------------------------------------
 #           sound-collecting code
 # -----------------------------------------------------------------------------------------------------------------
+sub turn_off_sound_input {
+  Glib::Source->remove($event_source_tag);
+  close_sound_input($dsp);
+}
+
 sub collect_sound {
   my @data;
   my $buff;
-  my ($dsp,$error) = open_sound_input($sampling_rate);
-  print "actual sampling rate=$sampling_rate\n";
-  if ($error) {$collect_sound_error = $error; return undef}
   my $template;
   if ($sample_size_bytes==2) {$template = "n$small_buff_size"}
   if ($sample_size_bytes==4) {$template = "N$small_buff_size"}
-  if (!defined $template) {$collect_sound_error = "illegal sample size, $sample_size_bytes bytes"; return undef}
-  while(read($dsp,$buff,$small_buff_size*$sample_size_bytes) && !$time_to_die) {
-    {
-      lock(@sound_data);
-      @sound_data = unpack($template,$buff);
-      $fresh_data = 1;
-    }
-  }
-  close_sound_input($dsp);
-  return 1;
+  if (!defined $template) {return "illegal sample size, $sample_size_bytes bytes"}
+  my $nbytes = $small_buff_size*$sample_size_bytes;
+  my $nread = read($dsp,$buff,$nbytes);
+  #print "nbytes=$nbytes, nread=$nread\n";
+  @sound_data = unpack($template,$buff);
+  put_new_data_in_circular_buffer();
+
+  return 0;
 }
 
 # -----------------------------------------------------------------------------------------------------------------
 #          GUI
 # -----------------------------------------------------------------------------------------------------------------
 sub draw {
-  {
-    lock(@sound_data);
-    @copy_of_sound_data = @sound_data;
-  }
-
   my $t1 = [Time::HiRes::gettimeofday];
 
-  put_new_data_in_circular_buffer();
   return if $mode eq 'f' && $n_valid_smalls<$n_small_buffs;
 
   # get current window size and freeze it, so x y scaling is constant in the pixmap
@@ -152,10 +146,16 @@ sub draw {
   if ($mode eq 'f') {draw_freq_mode($colormap,$gc,$w,$h)}
 
   #without this line the screen won't be updated until a screen action
-  $area->queue_draw;                                                      
+  $area->queue_draw; # "Once the main loop becomes idle (after the current batch of events has been processed, roughly), the window will receive expose events for the union of all regions that have been invalidated."
 
   my $t2 = [Time::HiRes::gettimeofday];
-  print "draw() took ",Time::HiRes::tv_interval($t1,$t2)," s\n";
+  #print "draw() took ",Time::HiRes::tv_interval($t1,$t2)," s\n";
+
+  # Without the following, we would only redraw when we got an expose event, which could be only when the event queue emptied out.
+  $area->window->draw_drawable(
+      $area->style->fg_gc( $area->state ), $pixmap,
+      0,0,0,0,-1,-1 # x,y (src), x,y (dest), w,h; -1 for w and h means copy whole thing
+  );
 
 }
 
@@ -171,6 +171,8 @@ sub draw_freq_mode {
   if ($moving_average_length>1) {
     my $ampl = $fft->rdft(); # complex amplitudes
     # FIXME: For efficiency, the following should only be applied to data in the range of frequencies that are actually being displayed.
+    # FIXME: Since this is all floating point, rounding errors will accumulate.
+    print "averaging ",(0+@fft_frames)," frames\n";
     if (@fft_frames>=$moving_average_length) {
       my $old = $fft_frames[0];
       for (my $i=0; $i<$big_buff_size; $i++) {
@@ -196,23 +198,28 @@ sub draw_freq_mode {
   }
 
   my $max_power = 0;
+  my $max_is_at = 0;
   for (my $i=$n_spectrum/8; $i<$n_spectrum*3/4; $i++) {
     my $power = $spectrum->[$i];
-    if ($power > $max_power) {$max_power = $power}
+    if ($power > $max_power) {$max_power = $power; $max_is_at = $i}
   }
+  if ($max_power==0) {$max_power=1.} # prevent div by zero later
+  print "max is at $max_is_at\n";
 
   my $x_shift = 1;
   while (($big_buff_size<<$x_shift)<$w/2) {++$x_shift}
-  $x_shift += 2;
 
-  #print "x_shift=$x_shift   top_frequency=",int(($sampling_rate/2)*($w<<$x_shift)/$big_buff_size)," Hz, one channel=",(($sampling_rate/2)/$big_buff_size)," Hz \n";
-
+  my $log_scale = sub {
+    my ($x,$y) = @_;
+    my $max_e_folds = 16;
+    my $u = -$max_e_folds;
+    if ($y/$max_power>0) {$u = log($y/$max_power)}
+    if ($u<-8) {$u= -$max_e_folds}
+    return (int($x)<<$x_shift,$h-int($h*$u/$max_e_folds));
+  };
   my $scale = sub {
     my ($x,$y) = @_;
-    my $u = -8;
-    if ($y/$max_power>0) {$u = log($y/$max_power)}
-    if ($u<-8) {$u= -8}
-    return (int($x)<<$x_shift,$h-int($h*$u/8));
+    return (int($x)<<$x_shift,$h-int($h*$y/$max_power*.5));
   };
 
   $gc->set_foreground(get_color($colormap, 'black'));
@@ -221,7 +228,6 @@ sub draw_freq_mode {
   my $k=0;
   foreach my $power(@$spectrum) {
     my ($x,$y) = &$scale($k,$power);
-    if ($k==100) {print "power=$power, max_power=$max_power, y=$y\n"}
     if ($k>2) {
       $pixmap->draw_rectangle($gc,1,$prev_x,$prev_y,($x-$prev_x),($h-$prev_y));
     }
@@ -231,7 +237,7 @@ sub draw_freq_mode {
   }
 
   my $t2 = [Time::HiRes::gettimeofday];
-  print "fft and drawing took ",Time::HiRes::tv_interval($t1,$t2)," s\n";
+  #print "fft and drawing took ",Time::HiRes::tv_interval($t1,$t2)," s\n";
 
 
   $first_valid_small = 0;
@@ -292,8 +298,7 @@ sub draw_time_mode {
 sub put_new_data_in_circular_buffer {
   # Splice the newly collected small buffer into the large circular buffer.
   my $k=($first_valid_small+$n_valid_smalls)%$n_small_buffs;
-  #print "splicing, big_buff=",(0+@big_buff)," copy_of_sound_data=",(0+@copy_of_sound_data),"\n";
-  splice @big_buff,$k*$small_buff_size,$small_buff_size,@copy_of_sound_data;
+  splice @big_buff,$k*$small_buff_size,$small_buff_size,@sound_data;
   ++$n_valid_smalls;
   if ($n_valid_smalls>$n_small_buffs) { # circular buffer has overflowed
     $n_valid_smalls = $n_small_buffs;
@@ -397,7 +402,7 @@ sub open_sound_input {
   my $was = $channels;
   ioctl $dsp, $dsp_constant{SNDCTL_DSP_CHANNELS}, $channels or return(undef,"error setting mono, $!");
 
-  return ($dsp,0);
+  return ($dsp,0,$sampling_rate);
 
 }
 
@@ -444,7 +449,7 @@ my ($x0,$y0,$x1,$y1,$width,) = (0,0,0,0);
 
 # Create the window
 $window = new Gtk2::Window ( "toplevel" );
-$window->signal_connect ("delete_event", sub { $time_to_die = 1; Gtk2->main_quit; });
+$window->signal_connect ("delete_event", sub { turn_off_sound_input(); Gtk2->main_quit; });
 $window->set_border_width (10);
 $window->set_size_request(1024+28,480); # oscilloscope area comes out 1024 pixels wide on my system
 $window->set_position('center');
