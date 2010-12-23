@@ -25,17 +25,28 @@ my %dsp_constant = (
     AFMT_S16_BE => 0x00000020 ,
 );
 
-my $small_buff_size_log2 = 9;
+# In both time and frequency mode, we read data in chunks of $small_buff_size samples.
+# These raw samples are stuck into a circular buffer of $big_buff_size samples.
+# In frequency mode:
+#   $big_buff_size is also the size of the fft frame.
+#   We can average the complex amplitudes over $moving_average_length frames.
+#   The defaults are $big_buff_size=8192, $moving_average_length=64. These were the defaults in fftexplorer, where they worked well.
+
+my $small_buff_size_log2 = 9;       # normally 9
+my $n_small_buffs_log2 = 2;         # normally 4; making this bigger makes fft (logarithmically) slower, but increases frequency resolution
+                                    # making this >=4 causes long delays between callbacks to draw()??
+my $moving_average_length_log2 = 4; # normally 6
+
 my $small_buff_size = (1<<$small_buff_size_log2);
-my $n_small_buffs_log2 = 2;  # making this bigger makes fft (logarithmically) slower, but increases frequency resolution
 my $n_small_buffs = (1<<$n_small_buffs_log2);
 my $big_buff_size = (1<<($n_small_buffs_log2+$small_buff_size_log2));
+my $moving_average_length = (1<<$moving_average_length_log2);
 
 my $sampling_rate = 48000; # request most common native rate; this may get changed based on what the sound card actually is willing to set itself to
-my $sample_size_bytes = 2; # 2 or 4
+my $sample_size_bytes = 2; # only 2 works
 my $mode = 'f'; # can be 'f' (frequency) or 't' (time)
 
-print "small_buff_size=$small_buff_size   n_small_buffs=$n_small_buffs    big_buff_size=$big_buff_size\n";
+print "small_buff_size=$small_buff_size   n_small_buffs=$n_small_buffs    big_buff_size=$big_buff_size    moving_average_length=$moving_average_length\n";
 
 # -----------------------------------------------------------------------------------------------------------------
 #          data shared between threads
@@ -57,20 +68,27 @@ my ($window,$area,$pixmap,%allocated_colors,$gc,$colormap);
 my @big_buff = (0) x $big_buff_size; # preallocate it for efficiency
 my $first_valid_small = 0;
 my $n_valid_smalls = 0;
+my @fft_frames = (); # array of refs to fft's (complex amplitudes); a FIFO buffer of length $moving_average_length
+my @fft_running_sum = (0) x ($big_buff_size); # the current sum of the spectra in fft_frames
+
 # -----------------------------------------------------------------------------------------------------------------
 #          create, run, and destroy GUI
 # -----------------------------------------------------------------------------------------------------------------
 my @copy_of_sound_data;
 gui_setup();
+my $redraw_callback = sub {
+  if ($fresh_data) {
+    $fresh_data = 0;
+    draw();
+  }
+  return 1; # 1 means don't automatically remove this callback
+};
 # The following could possibly be done more efficiently by using g_io_add_watch_full().
 my $event_source_tag = Glib::Idle->add(
-  sub {
-    if ($fresh_data) {
-      $fresh_data = 0;
-      draw();
-    }
-    return 1; # 1 means don't automatically remove this callback
-  }
+  $redraw_callback,
+  undef,
+  #Glib::G_PRIORITY_DEFAULT
+  #Glib::G_PRIORITY_HIGH_IDLE
 ); 
 Gtk2->main;
 $time_to_die = 1;
@@ -111,6 +129,8 @@ sub draw {
     @copy_of_sound_data = @sound_data;
   }
 
+  my $t1 = [Time::HiRes::gettimeofday];
+
   put_new_data_in_circular_buffer();
   return if $mode eq 'f' && $n_valid_smalls<$n_small_buffs;
 
@@ -133,23 +153,66 @@ sub draw {
 
   #without this line the screen won't be updated until a screen action
   $area->queue_draw;                                                      
+
+  my $t2 = [Time::HiRes::gettimeofday];
+  print "draw() took ",Time::HiRes::tv_interval($t1,$t2)," s\n";
+
 }
 
 sub draw_freq_mode {
   my ($colormap,$gc,$w,$h) = @_; #w=width, h=height
  
+  my $t1 = [Time::HiRes::gettimeofday];
+
+  my $n_spectrum = $big_buff_size/2;
+
+  my $spectrum;
   my $fft = Math::FFT->new(\@big_buff);
-  my $spectrum = $fft->spctrm(); # has $big_buff_size+1 elements
+  if ($moving_average_length>1) {
+    my $ampl = $fft->rdft(); # complex amplitudes
+    # FIXME: For efficiency, the following should only be applied to data in the range of frequencies that are actually being displayed.
+    if (@fft_frames>=$moving_average_length) {
+      my $old = $fft_frames[0];
+      for (my $i=0; $i<$big_buff_size; $i++) {
+        $fft_running_sum[$i] += ($ampl->[$i]-$old->[$i]);
+      }
+      shift @fft_frames; # I think by reference counting this should free the memory.
+    }
+    else {
+      for (my $i=0; $i<$big_buff_size; $i++) {
+        $fft_running_sum[$i] += $ampl->[$i];
+      }
+    }
+    push @fft_frames,$ampl;
+    $spectrum = [];
+    my $j = 0;
+    for (my $i=0; $i<$n_spectrum; $i++,$j+=2) {
+      my ($real,$imag) = ($fft_running_sum[$j],$fft_running_sum[$j+1]);
+      $spectrum->[$i] = $real*$real+$imag*$imag;
+    }    
+  }
+  else {
+    $spectrum = $fft->spctrm(); # has $big_buff_size/2+1 elements, but don't count on the final one to exist, because it won't if we're doing averaging
+  }
+
+  my $max_power = 0;
+  for (my $i=$n_spectrum/8; $i<$n_spectrum*3/4; $i++) {
+    my $power = $spectrum->[$i];
+    if ($power > $max_power) {$max_power = $power}
+  }
 
   my $x_shift = 1;
   while (($big_buff_size<<$x_shift)<$w/2) {++$x_shift}
+  $x_shift += 2;
 
   #print "x_shift=$x_shift   top_frequency=",int(($sampling_rate/2)*($w<<$x_shift)/$big_buff_size)," Hz, one channel=",(($sampling_rate/2)/$big_buff_size)," Hz \n";
 
   my $scale = sub {
-    use integer;
     my ($x,$y) = @_;
-    return ($x<<$x_shift,$h-($y>>7));
+    my $u = -8;
+    if ($y/$max_power>0) {$u = log($y/$max_power)}
+    if ($u<-8) {$u= -8}
+    return (int($x)<<$x_shift,$h-int($h*$u/8));
   };
 
   $gc->set_foreground(get_color($colormap, 'black'));
@@ -158,6 +221,7 @@ sub draw_freq_mode {
   my $k=0;
   foreach my $power(@$spectrum) {
     my ($x,$y) = &$scale($k,$power);
+    if ($k==100) {print "power=$power, max_power=$max_power, y=$y\n"}
     if ($k>2) {
       $pixmap->draw_rectangle($gc,1,$prev_x,$prev_y,($x-$prev_x),($h-$prev_y));
     }
@@ -165,6 +229,10 @@ sub draw_freq_mode {
     ($prev_x,$prev_y) =($x,$y);
     ++$k;
   }
+
+  my $t2 = [Time::HiRes::gettimeofday];
+  print "fft and drawing took ",Time::HiRes::tv_interval($t1,$t2)," s\n";
+
 
   $first_valid_small = 0;
   $n_valid_smalls = 0;
