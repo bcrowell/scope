@@ -28,7 +28,7 @@ my %dsp_constant = (
 # In frequency mode:
 #   $big_buff_size is also the size of the fft frame.
 #   We can average the complex amplitudes over $moving_average_length frames.
-#   The defaults are $big_buff_size=8192=2^13, $moving_average_length=64. 
+#   The defaults are $big_buff_size=8192=2^13, $moving_average_length=1 or 64. 
 #   In fftexplorer, these are the defaults (if averaging is turned on).
 
 my $small_buff_size_log2 = 9;       # normally 9; if too small, may get bogged down by gtk events
@@ -59,26 +59,20 @@ my @big_buff = (0) x $big_buff_size; # preallocate it for efficiency
 my $first_valid_small = 0;
 my $n_valid_smalls = 0;
 
-my @fft_frames; # array of refs to fft's (complex amplitudes); a FIFO buffer of length $moving_average_length
+# The following variables are for the FIFO buffer used in the moving average. They all get initialized by zero_moving_average_fifo().
+# The FIFO has a length of $moving_average_length.
+my @fft_frames; # array of refs to fft's (complex amplitudes)
 my @fft_running_sum; # the current sum of the spectra in fft_frames
+my $fifo_frames_accumulated; # only used for keeping track of damping used to prevent accumulation of rounding errors
 zero_moving_average_fifo();
-
-# Fill moving average FIFO with zero frames; otherwise signals don't start to decay until the FIFO fills.
-sub zero_moving_average_fifo {
-  my @blank = (0) x $big_buff_size; # FIFO will originally be filled with refs to the same object, @blank. That's OK, because it's read-only. It gets deallocated when FIFO fills.
-  for (my $i=0; $i<$moving_average_length; $i++) {
-    $fft_frames[$i] = \@blank;
-  }
-  @fft_running_sum = @blank;
-}
 
 # -----------------------------------------------------------------------------------------------------------------
 #          open sound input
 # -----------------------------------------------------------------------------------------------------------------
 my ($dsp,$error,$sampling_rate) = open_sound_input($desired_sampling_rate);
-print "actual sampling rate=$sampling_rate, dsp fileno=",fileno($dsp),"\n";
 if ($error) {die "error opening sound input, $error"}
 
+print "actual sampling rate=$sampling_rate\n";
 print "small_buff_size=$small_buff_size   n_small_buffs=$n_small_buffs    big_buff_size=$big_buff_size    moving_average_length=$moving_average_length\n";
 print "reads will happen every ",((1./$sampling_rate)*$small_buff_size)," s,",
       " fft frame filled once every ",((1./$sampling_rate)*$small_buff_size)*$n_small_buffs," s",
@@ -180,9 +174,9 @@ sub draw_freq_mode {
   my $fft = Math::FFT->new(\@big_buff);
   if ($moving_average_length>1) {
     my $ampl = $fft->rdft(); # complex amplitudes
+    damp_moving_average_fifo(); # make sure rounding errors don't accumulate
     # For efficiency, the following should actually only be applied to data in the range of frequencies that are actually being displayed. But profiling shows that
     # this is not eating up a significant fraction of CPU time on my machine.
-    # FIXME: Since this is all floating point, rounding errors will accumulate.
     # FIXME: There is a phase error, which is a function of frequency and should be corrected for.
     if (@fft_frames>=$moving_average_length) {
       my $old = $fft_frames[0];
@@ -191,7 +185,7 @@ sub draw_freq_mode {
       }
       shift @fft_frames; # I think by reference counting this should free the memory.
     }
-    else {
+    else { # Correctly handle the case where there are fewer than $moving_average_length frames in the FIFO, but my current implementation fills the FIFO with zero frames initially.
       for (my $i=0; $i<$big_buff_size; $i++) {
         $fft_running_sum[$i] += $ampl->[$i];
       }
@@ -210,6 +204,10 @@ sub draw_freq_mode {
 
   my $x_shift = 1;
   while (($big_buff_size<<$x_shift)<$w/2) {++$x_shift}
+  my $scale_x = sub {
+    my $x = shift;
+    return int($x)<<$x_shift;
+  };
 
   my $scale = sub {
     my ($x,$y) = @_;
@@ -222,11 +220,13 @@ sub draw_freq_mode {
         $u=0;
       }
     }
-    return (int($x)<<$x_shift,$h-int($h*$u));
+    return (&$scale_x($x),$h-int($h*$u));
   };
 
+  #---- Draw scale and grid.
+  draw_frequency_scale_and_grid($gc,$pixmap,$sampling_rate,$scale_x,$w,$h,$big_buff_size);
+  #---- Draw spectrum.
   $gc->set_foreground(get_color($colormap, 'black'));
-
   my ($prev_x,$prev_y) = &$scale(0,0);
   my $k=0;
   foreach my $power(@$spectrum) {
@@ -245,6 +245,55 @@ sub draw_freq_mode {
 
   $first_valid_small = 0;
   $n_valid_smalls = 0;
+}
+
+sub draw_frequency_scale_and_grid {
+  my ($gc,$pixmap,$sampling_rate,$scale_x,$w,$h,$big_buff_size) = (@_);
+  $gc->set_foreground(get_color($colormap, 'gray'));
+  my $nyquist = $sampling_rate/2.;
+  my $scale_factor = &$scale_x(1000)/1000.;
+  my $top_f_displayed = $nyquist*$w/($scale_factor*$big_buff_size);
+  my $grid_interval = optimal_grid_spacing($top_f_displayed);
+  my $layout = make_text_layout();
+  for (my $f=$grid_interval; $f<$top_f_displayed; $f+=$grid_interval) {
+    my $k = ($f/$nyquist)*$big_buff_size;
+    my $x = &$scale_x($k);
+    last if $x>$w;
+    $pixmap->draw_line($gc,$x,0,$x,$h);
+    $layout->set_text ($f);
+    $pixmap->draw_layout($gc,$x-15,30,$layout);
+    $layout->set_text ('Hz');
+    $pixmap->draw_layout($gc,$x-15,45,$layout);
+  }
+}
+
+sub make_text_layout {
+  my $surface = Cairo::ImageSurface->create ('argb32', 300, 200); # http://cairographics.org/documentation/cairomm/reference/namespaceCairo.html#d3f86970e1bd354b263303c9b8759166
+  my $cr = Cairo::Context->create ($surface);
+  my $layout = Gtk2::Pango::Cairo::create_layout ($cr);
+  return $layout;
+}
+
+sub optimal_grid_spacing {
+  my $max = shift;
+  my $z = log($max)/log(10.);
+  my $zf = $z-int($z);
+  my $q = exp($zf*log(10.)); # e.g., if top freq displayed is 7000 Hz, q=7
+  my $best = 999.;
+  my $best_r = 1;
+  my $optimal_n_lines = 30;
+  my $root_10 = sqrt(10.);
+  foreach my $r(1,2,5) { # r=spacing of grid
+    my $n = $q/$r; # how many divisions would we have with this spacing?
+    while ($n<$optimal_n_lines/$root_10) {$n*=10}
+    while ($n>$optimal_n_lines*$root_10) {$n/=10}
+    my $badness = abs(log($n/10.));
+    if ($badness<$best) {$best_r=$r; $best=$badness}
+  }
+  my $grid_interval = $best_r;
+  while ($max/$grid_interval < $optimal_n_lines/$root_10) {$grid_interval /= 10.}
+  while ($max/$grid_interval > $optimal_n_lines*$root_10) {$grid_interval *= 10.}
+  return $grid_interval;
 }
 
 sub draw_time_mode {
@@ -296,6 +345,35 @@ sub draw_time_mode {
   $first_valid_small = ($first_valid_small+$n_valid_smalls)%$n_small_buffs;
   $n_valid_smalls = 0;
 
+}
+
+# Fill moving average FIFO with zero frames; otherwise signals don't start to decay until the FIFO fills.
+sub zero_moving_average_fifo {
+  my @blank = (0) x $big_buff_size; # FIFO will originally be filled with refs to the same object, @blank. That's OK, because it's read-only. It gets deallocated when FIFO fills.
+  for (my $i=0; $i<$moving_average_length; $i++) {
+    $fft_frames[$i] = \@blank;
+  }
+  @fft_running_sum = @blank;
+  $fifo_frames_accumulated = 0;
+}
+
+# We maintain the running sum by adding in the freshest frame and subtracting the one that's being pushed out of the back of the FIFO.
+# If the program runs indefinitely, this can produce rounding errors that accumulate, so put in a tiny bit of artificial damping.
+# It might be possible to do this more smoothly by altering the code that maintains the running sum so that it did sum=a*sum+b*newest-c*oldest,
+# where a, b, and c were not equal to 1, 1, and 1. However, this would introduce more computation for each frame, and I'm also not certain that
+# it would actually be stable numerically against the accumulation of rounding errors.
+sub damp_moving_average_fifo {
+  if ($fifo_frames_accumulated++>$moving_average_length+100) {
+    $fifo_frames_accumulated = 0;
+    my $damping_factor = 0.99; # gentle, so it doesn't produce visible glitches
+    for (my $i=0; $i<$big_buff_size; $i++) {
+      $fft_running_sum[$i] *= $damping_factor;
+      my $frame = $fft_frames[$i];
+      for (my $j=0; $j<$moving_average_length; $j++) {
+        $frame->[$j] *= $damping_factor;
+      }
+    }
+  }
 }
 
 sub put_new_data_in_circular_buffer {
