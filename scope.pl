@@ -28,14 +28,13 @@ my %dsp_constant = (
 # In frequency mode:
 #   $big_buff_size is also the size of the fft frame.
 #   We can average the complex amplitudes over $moving_average_length frames.
-#   The defaults are $big_buff_size=8192, $moving_average_length=64. 
+#   The defaults are $big_buff_size=8192=2^13, $moving_average_length=64. 
 #   In fftexplorer, these are the defaults (if averaging is turned on).
 
 my $small_buff_size_log2 = 9;       # normally 9; if too small, may get bogged down by gtk events
                                     # In my current implementation of time mode, this also affects how long a trace can be.
 my $n_small_buffs_log2 = 4;         # normally 4; making this bigger makes fft (logarithmically) slower, but increases frequency resolution
-                                    # making this >=4 causes long delays between callbacks to draw()??
-my $moving_average_length_log2 = 0; # normally 6
+my $moving_average_length_log2 = 0; # normally 0 or 6
 
 my $small_buff_size = (1<<$small_buff_size_log2);
 my $n_small_buffs = (1<<$n_small_buffs_log2);
@@ -59,8 +58,19 @@ my ($window,$area,$pixmap,%allocated_colors,$gc,$colormap);
 my @big_buff = (0) x $big_buff_size; # preallocate it for efficiency
 my $first_valid_small = 0;
 my $n_valid_smalls = 0;
-my @fft_frames = (); # array of refs to fft's (complex amplitudes); a FIFO buffer of length $moving_average_length
-my @fft_running_sum = (0) x ($big_buff_size); # the current sum of the spectra in fft_frames
+
+my @fft_frames; # array of refs to fft's (complex amplitudes); a FIFO buffer of length $moving_average_length
+my @fft_running_sum; # the current sum of the spectra in fft_frames
+zero_moving_average_fifo();
+
+# Fill moving average FIFO with zero frames; otherwise signals don't start to decay until the FIFO fills.
+sub zero_moving_average_fifo {
+  my @blank = (0) x $big_buff_size; # FIFO will originally be filled with refs to the same object, @blank. That's OK, because it's read-only. It gets deallocated when FIFO fills.
+  for (my $i=0; $i<$moving_average_length; $i++) {
+    $fft_frames[$i] = \@blank;
+  }
+  @fft_running_sum = @blank;
+}
 
 # -----------------------------------------------------------------------------------------------------------------
 #          open sound input
@@ -170,9 +180,10 @@ sub draw_freq_mode {
   my $fft = Math::FFT->new(\@big_buff);
   if ($moving_average_length>1) {
     my $ampl = $fft->rdft(); # complex amplitudes
-    # FIXME: For efficiency, the following should only be applied to data in the range of frequencies that are actually being displayed.
+    # For efficiency, the following should actually only be applied to data in the range of frequencies that are actually being displayed. But profiling shows that
+    # this is not eating up a significant fraction of CPU time on my machine.
     # FIXME: Since this is all floating point, rounding errors will accumulate.
-    print "averaging ",(0+@fft_frames)," frames\n";
+    # FIXME: There is a phase error, which is a function of frequency and should be corrected for.
     if (@fft_frames>=$moving_average_length) {
       my $old = $fft_frames[0];
       for (my $i=0; $i<$big_buff_size; $i++) {
@@ -197,29 +208,21 @@ sub draw_freq_mode {
     $spectrum = $fft->spctrm(); # has $big_buff_size/2+1 elements, but don't count on the final one to exist, because it won't if we're doing averaging
   }
 
-  my $max_power = 0;
-  my $max_is_at = 0;
-  for (my $i=$n_spectrum/8; $i<$n_spectrum*3/4; $i++) {
-    my $power = $spectrum->[$i];
-    if ($power > $max_power) {$max_power = $power; $max_is_at = $i}
-  }
-  if ($max_power==0) {$max_power=1.} # prevent div by zero later
-  print "max is at $max_is_at\n";
-
   my $x_shift = 1;
   while (($big_buff_size<<$x_shift)<$w/2) {++$x_shift}
 
-  my $log_scale = sub {
-    my ($x,$y) = @_;
-    my $max_e_folds = 16;
-    my $u = -$max_e_folds;
-    if ($y/$max_power>0) {$u = log($y/$max_power)}
-    if ($u<-8) {$u= -$max_e_folds}
-    return (int($x)<<$x_shift,$h-int($h*$u/$max_e_folds));
-  };
   my $scale = sub {
     my ($x,$y) = @_;
-    return (int($x)<<$x_shift,$h-int($h*$y/$max_power*.5));
+    my $u = sqrt($y)*.001/$moving_average_length; # if u=0 to 1, it's in range
+    if (0) { # optional logarithmic rescaling
+      if ($u>0) {
+        $u = 1.+(log($u)/log(10.))/2.;
+      }
+      else {
+        $u=0;
+      }
+    }
+    return (int($x)<<$x_shift,$h-int($h*$u));
   };
 
   $gc->set_foreground(get_color($colormap, 'black'));
