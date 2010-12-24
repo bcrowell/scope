@@ -15,6 +15,7 @@ use Math::FFT;
 #   Looking at fftexplorer's source code, it looks like it simply averages the complex amplitudes of n frames, and that's what I've done here.
 #   But actually that doesn't make much sense. For any given frequency f, there is a known phase relationship between one frame and the next.
 #   This should be taken into account, and in fact by the time you've done that, you've really just made the fft frame bigger. So why not just do that?
+#   Removed moving average code for this reason.
 
 # The following are from Audio::OSS's Constants.pm, which is constructed by its Makefile.PL by compiling a C program that #includes soundfile.h.
 # This works on intel (little-endian). I think these might have to be swapped to work on ARM (which can be either little- or big-endian).
@@ -32,19 +33,15 @@ my %dsp_constant = (
 # These raw samples are stuck into a circular buffer of $big_buff_size samples.
 # In frequency mode:
 #   $big_buff_size is also the size of the fft frame.
-#   We can average the complex amplitudes over $moving_average_length frames.
-#   The defaults are $big_buff_size=8192=2^13, $moving_average_length=1 or 64. 
-#   In fftexplorer, these are the defaults (if averaging is turned on).
+#   The defaults is $big_buff_size=8192=2^13, which was the default in fftexplorer and seems to work well.
 
 my $small_buff_size_log2 = 9;       # normally 9; if too small, may get bogged down by gtk events
                                     # In my current implementation of time mode, this also affects how long a trace can be.
 my $n_small_buffs_log2 = 4;         # normally 4; making this bigger makes fft (logarithmically) slower, but increases frequency resolution
-my $moving_average_length_log2 = 0; # normally 0 or 6
 
 my $small_buff_size = (1<<$small_buff_size_log2);
 my $n_small_buffs = (1<<$n_small_buffs_log2);
 my $big_buff_size = (1<<($n_small_buffs_log2+$small_buff_size_log2));
-my $moving_average_length = (1<<$moving_average_length_log2);
 
 my $desired_sampling_rate = 48000; # request most common native rate; this may get changed based on what the sound card actually is willing to set itself to
 my $sample_size_bytes = 2; # only 2 works
@@ -65,13 +62,6 @@ my @big_buff = (0) x $big_buff_size; # preallocate it for efficiency
 my $first_valid_small = 0;
 my $n_valid_smalls = 0;
 
-# The following variables are for the FIFO buffer used in the moving average. They all get initialized by zero_moving_average_fifo().
-# The FIFO has a length of $moving_average_length.
-my @fft_frames; # array of refs to fft's (complex amplitudes)
-my @fft_running_sum; # the current sum of the spectra in fft_frames
-my $fifo_frames_accumulated; # only used for keeping track of damping used to prevent accumulation of rounding errors
-zero_moving_average_fifo();
-
 # -----------------------------------------------------------------------------------------------------------------
 #          open sound input
 # -----------------------------------------------------------------------------------------------------------------
@@ -83,11 +73,12 @@ sub start_sound_input {
 start_sound_input();
 
 print "actual sampling rate=$sampling_rate\n";
-print "small_buff_size=$small_buff_size   n_small_buffs=$n_small_buffs    big_buff_size=$big_buff_size    moving_average_length=$moving_average_length\n";
+print "small_buff_size=$small_buff_size   n_small_buffs=$n_small_buffs    big_buff_size=$big_buff_size \n";
 print "reads will happen every ",((1./$sampling_rate)*$small_buff_size)," s,",
       " fft frame filled once every ",((1./$sampling_rate)*$small_buff_size)*$n_small_buffs," s",
-      " time to refresh moving average is ",((1./$sampling_rate)*$small_buff_size)*$n_small_buffs*$moving_average_length," s",
       "\n";
+my $nyquist = $sampling_rate/2;
+my $f_hi = $nyquist; # as high as it can go
 
 # -----------------------------------------------------------------------------------------------------------------
 #          create, run, and destroy GUI
@@ -159,7 +150,7 @@ sub draw {
   $pixmap->draw_rectangle($gc,1,0,0,$w,$h); # x,y,w,h
 
   if ($mode eq 't') {draw_time_mode($colormap,$gc,$w,$h)}
-  if ($mode eq 'f') {draw_freq_mode($colormap,$gc,$w,$h)}
+  if ($mode eq 'f') {draw_freq_mode($colormap,$gc,$w,$h,0,$f_hi)}
 
   #without this line the screen won't be updated until a screen action
   $area->queue_draw; # "Once the main loop becomes idle (after the current batch of events has been processed, roughly), the window will receive expose events for the union of all regions that have been invalidated."
@@ -176,7 +167,7 @@ sub draw {
 }
 
 sub draw_freq_mode {
-  my ($colormap,$gc,$w,$h) = @_; #w=width, h=height
+  my ($colormap,$gc,$w,$h,$f_lo,$f_hi) = @_; #w=width, h=height, in pixels
  
   my $t1 = [Time::HiRes::gettimeofday];
 
@@ -184,34 +175,7 @@ sub draw_freq_mode {
 
   my $spectrum;
   my $fft = Math::FFT->new(\@big_buff);
-  if ($moving_average_length>1) {
-    my $ampl = $fft->rdft(); # complex amplitudes
-    damp_moving_average_fifo(); # make sure rounding errors don't accumulate
-    # For efficiency, the following should actually only be applied to data in the range of frequencies that are actually being displayed. But profiling shows that
-    # this is not eating up a significant fraction of CPU time on my machine.
-    if (@fft_frames>=$moving_average_length) {
-      my $old = $fft_frames[0];
-      for (my $i=0; $i<$big_buff_size; $i++) {
-        $fft_running_sum[$i] += ($ampl->[$i]-$old->[$i]);
-      }
-      shift @fft_frames; # I think by reference counting this should free the memory.
-    }
-    else { # Correctly handle the case where there are fewer than $moving_average_length frames in the FIFO, but my current implementation fills the FIFO with zero frames initially.
-      for (my $i=0; $i<$big_buff_size; $i++) {
-        $fft_running_sum[$i] += $ampl->[$i];
-      }
-    }
-    push @fft_frames,$ampl;
-    $spectrum = [];
-    my $j = 0;
-    for (my $i=0; $i<$n_spectrum; $i++,$j+=2) {
-      my ($real,$imag) = ($fft_running_sum[$j],$fft_running_sum[$j+1]);
-      $spectrum->[$i] = $real*$real+$imag*$imag;
-    }    
-  }
-  else {
-    $spectrum = $fft->spctrm(); # has $big_buff_size/2+1 elements, but don't count on the final one to exist, because it won't if we're doing averaging
-  }
+  $spectrum = $fft->spctrm(); # has $big_buff_size/2+1 elements
 
   my $x_shift = 1;
   while (($big_buff_size<<$x_shift)<$w/2) {++$x_shift}
@@ -222,7 +186,7 @@ sub draw_freq_mode {
 
   my $scale = sub {
     my ($x,$y) = @_;
-    my $u = sqrt($y)*.001/$moving_average_length; # if u=0 to 1, it's in range
+    my $u = sqrt($y)*.001; # if u=0 to 1, it's in range
     if (0) { # optional logarithmic rescaling
       if ($u>0) {
         $u = 1.+(log($u)/log(10.))/2.;
@@ -356,35 +320,6 @@ sub draw_time_mode {
   $first_valid_small = ($first_valid_small+$n_valid_smalls)%$n_small_buffs;
   $n_valid_smalls = 0;
 
-}
-
-# Fill moving average FIFO with zero frames; otherwise signals don't start to decay until the FIFO fills.
-sub zero_moving_average_fifo {
-  my @blank = (0) x $big_buff_size; # FIFO will originally be filled with refs to the same object, @blank. That's OK, because it's read-only. It gets deallocated when FIFO fills.
-  for (my $i=0; $i<$moving_average_length; $i++) {
-    $fft_frames[$i] = \@blank;
-  }
-  @fft_running_sum = @blank;
-  $fifo_frames_accumulated = 0;
-}
-
-# We maintain the running sum by adding in the freshest frame and subtracting the one that's being pushed out of the back of the FIFO.
-# If the program runs indefinitely, this can produce rounding errors that accumulate, so put in a tiny bit of artificial damping.
-# It might be possible to do this more smoothly by altering the code that maintains the running sum so that it did sum=a*sum+b*newest-c*oldest,
-# where a, b, and c were not equal to 1, 1, and 1. However, this would introduce more computation for each frame, and I'm also not certain that
-# it would actually be stable numerically against the accumulation of rounding errors.
-sub damp_moving_average_fifo {
-  if ($fifo_frames_accumulated++>$moving_average_length+100) {
-    $fifo_frames_accumulated = 0;
-    my $damping_factor = 0.99; # gentle, so it doesn't produce visible glitches
-    for (my $i=0; $i<$big_buff_size; $i++) {
-      $fft_running_sum[$i] *= $damping_factor;
-      my $frame = $fft_frames[$i];
-      for (my $j=0; $j<$moving_average_length; $j++) {
-        $frame->[$j] *= $damping_factor;
-      }
-    }
-  }
 }
 
 sub put_new_data_in_circular_buffer {
