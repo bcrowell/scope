@@ -54,6 +54,7 @@ my $pixels_per_channel_log2 = -1;
 #          global data related to GUI
 # -----------------------------------------------------------------------------------------------------------------
 my @sound_data;
+my $spectrum;
 my ($window,$area,$pixmap,%allocated_colors,$gc,$colormap);
 my @big_buff = (0) x $big_buff_size; # preallocate it for efficiency
 my $first_valid_small = 0;
@@ -91,12 +92,11 @@ $event_source_tag = Glib::IO->add_watch(
     if ($go) {
       my $err = collect_sound();
       if ($err!=0) {die $err}
-      my $spectrum;
       if ($mode eq 'f') {
         my $fft = Math::FFT->new(\@big_buff);
         $spectrum = $fft->spctrm(); # has $big_buff_size/2+1 elements
       }
-      if (!$busy_drawing) {$busy_drawing=1; draw($spectrum); $busy_drawing=0}
+      if (!$busy_drawing) {$busy_drawing=1; draw(); $busy_drawing=0}
     }
     return 1;
   }
@@ -131,7 +131,6 @@ sub collect_sound {
 #          GUI
 # -----------------------------------------------------------------------------------------------------------------
 sub draw {
-  my $spectrum = shift; # can be undef if in time mode
   my $t1 = [Time::HiRes::gettimeofday];
 
   return if $mode eq 'f' && $n_valid_smalls<$n_small_buffs;
@@ -180,10 +179,11 @@ sub draw_freq_mode {
   if ($pixels_per_channel_log2>0) {$pixels_per_channel = 1<<$pixels_per_channel_log2}
   if ($pixels_per_channel_log2<0) {$pixels_per_channel = 1./(1<<(-$pixels_per_channel_log2))}
   my $f_hi = $f_lo + $nyquist*$w/$big_buff_size/$pixels_per_channel; # one pixel per channel
+  my $chan_lo = int(($f_lo/$nyquist)*$big_buff_size);
 
   my $scale_x = sub {
-    my $x = shift;
-    return bit_shift_left(int($x),$pixels_per_channel_log2);
+    my $chan = shift;
+    return bit_shift_left(int($chan),$pixels_per_channel_log2);
   };
 
   my $scale = sub {
@@ -200,21 +200,8 @@ sub draw_freq_mode {
     return (&$scale_x($x),$h-int($h*$u));
   };
 
-  #---- Draw scale and grid.
-  draw_frequency_scale_and_grid($gc,$pixmap,$f_lo,$f_hi,$scale_x,$w,$h,$big_buff_size);
-  #---- Draw spectrum.
-  $gc->set_foreground(get_color($colormap, 'black'));
-  my ($prev_x,$prev_y) = &$scale(0,0);
-  my $k=0;
-  foreach my $power(@$spectrum) {
-    my ($x,$y) = &$scale($k,$power);
-    if ($k>2) {
-      $pixmap->draw_rectangle($gc,1,$prev_x,$prev_y,($x-$prev_x),($h-$prev_y));
-    }
-    last if $x>$w;
-    ($prev_x,$prev_y) =($x,$y);
-    ++$k;
-  }
+  draw_frequency_scale_and_grid($gc,$pixmap,$f_lo,$f_hi,$scale_x,$w,$h,$big_buff_size,$chan_lo);
+  draw_spectrum($spectrum,$gc,$pixmap,$f_lo,$f_hi,$scale_x,$scale,$w,$h,$big_buff_size,$chan_lo) if defined $spectrum;
 
   my $t2 = [Time::HiRes::gettimeofday];
   #print "fft and drawing took ",Time::HiRes::tv_interval($t1,$t2)," s\n";
@@ -224,8 +211,26 @@ sub draw_freq_mode {
   $n_valid_smalls = 0;
 }
 
+sub draw_spectrum {
+  my ($spectrum,$gc,$pixmap,$f_lo,$f_hi,$scale_x,$scale,$w,$h,$big_buff_size,$chan_lo) = @_;
+  return if !defined $spectrum;
+  $gc->set_foreground(get_color($colormap, 'black'));
+  my ($prev_x,$prev_y) = &$scale(0,0);
+  my $max_k = (@$spectrum)-1;
+  for (my $k=$chan_lo; $k<$max_k; $k++) {
+    my $power = $spectrum->[$k];
+    my ($x,$y) = &$scale($k-$chan_lo,$power);
+    if ($k>$chan_lo) {
+      $pixmap->draw_rectangle($gc,1,$prev_x,$prev_y,($x-$prev_x),($h-$prev_y));
+    }
+    last if $x>$w;
+    ($prev_x,$prev_y) =($x,$y);
+    ++$k;
+  }
+}
+
 sub draw_frequency_scale_and_grid {
-  my ($gc,$pixmap,$f_lo,$f_hi,$scale_x,$w,$h,$big_buff_size) = (@_);
+  my ($gc,$pixmap,$f_lo,$f_hi,$scale_x,$w,$h,$big_buff_size,$chan_lo) = @_;
   $gc->set_foreground(get_color($colormap, 'gray'));
   my $scale_factor = &$scale_x(1000)/1000.;
   my $freq_range = $f_hi-$f_lo;
@@ -235,13 +240,15 @@ sub draw_frequency_scale_and_grid {
   #print "f_lo=$f_lo f_hi=$f_hi f1=$f1 grid_interval=$grid_interval nyquist=$nyquist\n";
   for (my $f=$f1; $f<$f_hi; $f+=$grid_interval) {
     my $k = ($f/$nyquist)*$big_buff_size;
-    my $x = &$scale_x($k);
-    last if $x>$w;
-    $pixmap->draw_line($gc,$x,0,$x,$h);
-    $layout->set_text ($f);
-    $pixmap->draw_layout($gc,$x-15,30,$layout);
-    $layout->set_text ('Hz');
-    $pixmap->draw_layout($gc,$x-15,45,$layout);
+    if ($k>$chan_lo) {
+      my $x = &$scale_x($k-$chan_lo);
+      last if $x>$w;
+      $pixmap->draw_line($gc,$x,0,$x,$h);
+      $layout->set_text ($f);
+      $pixmap->draw_layout($gc,$x-15,30,$layout);
+      $layout->set_text ('Hz');
+      $pixmap->draw_layout($gc,$x-15,45,$layout);
+    }
   }
 }
 
@@ -510,10 +517,10 @@ my %buttons = (
     if ($mode eq 'f') {$mode = 't'} else {$mode = 'f'}
   },
   'Zoom In' => sub {
-    if ($pixels_per_channel_log2<6) {++$pixels_per_channel_log2}
+    if ($pixels_per_channel_log2<6) {++$pixels_per_channel_log2; draw()}
   },
   'Zoom Out' => sub {
-    if ($pixels_per_channel_log2>-3) {--$pixels_per_channel_log2}
+    if ($pixels_per_channel_log2>-3) {--$pixels_per_channel_log2; draw()}
   },
 );
 
@@ -533,7 +540,9 @@ $area->set_events ([qw/exposure-mask
 		       pointer-motion-mask
 		       pointer-motion-hint-mask/]);
 
-$area->signal_connect (button_press_event => \&button_press_event);
+$area->signal_connect (button_press_event => sub {
+  print "button\n";
+});
 # Signals used to handle backing pixmap
 $area->signal_connect( expose_event    => \&expose_event );
 $area->signal_connect( configure_event => \&configure_event );
