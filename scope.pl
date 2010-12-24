@@ -11,6 +11,11 @@ use IO::File;
 use Time::HiRes;
 use Math::FFT;
 
+# Notes on moving average:
+#   Looking at fftexplorer's source code, it looks like it simply averages the complex amplitudes of n frames, and that's what I've done here.
+#   But actually that doesn't make much sense. For any given frequency f, there is a known phase relationship between one frame and the next.
+#   This should be taken into account, and in fact by the time you've done that, you've really just made the fft frame bigger. So why not just do that?
+
 # The following are from Audio::OSS's Constants.pm, which is constructed by its Makefile.PL by compiling a C program that #includes soundfile.h.
 # This works on intel (little-endian). I think these might have to be swapped to work on ARM (which can be either little- or big-endian).
 my %dsp_constant = (
@@ -45,6 +50,7 @@ my $desired_sampling_rate = 48000; # request most common native rate; this may g
 my $sample_size_bytes = 2; # only 2 works
 my $mode = 'f'; # can be 'f' (frequency) or 't' (time)
 
+my $go = 1; # boolean, should we be collecting and displaying data, or not?
 
 # -----------------------------------------------------------------------------------------------------------------
 #          data shared between threads
@@ -69,8 +75,12 @@ zero_moving_average_fifo();
 # -----------------------------------------------------------------------------------------------------------------
 #          open sound input
 # -----------------------------------------------------------------------------------------------------------------
-my ($dsp,$error,$sampling_rate) = open_sound_input($desired_sampling_rate);
-if ($error) {die "error opening sound input, $error"}
+my ($dsp,$error,$sampling_rate);
+sub start_sound_input {
+  ($dsp,$error,$sampling_rate) = open_sound_input($desired_sampling_rate);
+  if ($error) {die "error opening sound input, $error"}
+}
+start_sound_input();
 
 print "actual sampling rate=$sampling_rate\n";
 print "small_buff_size=$small_buff_size   n_small_buffs=$n_small_buffs    big_buff_size=$big_buff_size    moving_average_length=$moving_average_length\n";
@@ -91,9 +101,11 @@ $event_source_tag = Glib::IO->add_watch(
   fileno($dsp),
   'in',
   sub {
-    my $err = collect_sound();
-    if ($err!=0) {die $err}
-    if (!$busy_drawing) {$busy_drawing=1; draw(); $busy_drawing=0}
+    if ($go) {
+      my $err = collect_sound();
+      if ($err!=0) {die $err}
+      if (!$busy_drawing) {$busy_drawing=1; draw(); $busy_drawing=0}
+    }
     return 1;
   }
 );
@@ -177,7 +189,6 @@ sub draw_freq_mode {
     damp_moving_average_fifo(); # make sure rounding errors don't accumulate
     # For efficiency, the following should actually only be applied to data in the range of frequencies that are actually being displayed. But profiling shows that
     # this is not eating up a significant fraction of CPU time on my machine.
-    # FIXME: There is a phase error, which is a function of frequency and should be corrected for.
     if (@fft_frames>=$moving_average_length) {
       my $old = $fft_frames[0];
       for (my $i=0; $i<$big_buff_size; $i++) {
@@ -547,9 +558,17 @@ my $hbox1 = Gtk2::HBox->new( 0, 0 );
 $vbox->pack_start($hbox1,0,0,0);
 $hbox1->set_border_width(2);
 
-my $button1 = Gtk2::Button->new('Draw');
+my $button1 = Gtk2::Button->new('Start/Stop');
 $hbox1->pack_start( $button1, FALSE, FALSE, 2);
-$button1->signal_connect( clicked => \&draw);
+$button1->signal_connect( clicked => sub {
+  $go = !$go;
+  if (!$go) {
+    close_sound_input($dsp);
+  }
+  else {
+    start_sound_input();
+  }
+});
 
 # Create the drawing area.
 $area = new Gtk2::DrawingArea; #don't confuse with Gtk2::Drawable
