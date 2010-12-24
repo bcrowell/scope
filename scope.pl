@@ -541,7 +541,8 @@ $area->set_events ([qw/exposure-mask
 		       pointer-motion-hint-mask/]);
 
 $area->signal_connect (button_press_event => sub {
-  print "button\n";
+  my $event = shift;
+  print "button, ",ref($event),"\n";
 });
 # Signals used to handle backing pixmap
 $area->signal_connect( expose_event    => \&expose_event );
