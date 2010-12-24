@@ -48,15 +48,12 @@ my $sample_size_bytes = 2; # only 2 works
 my $mode = 'f'; # can be 'f' (frequency) or 't' (time)
 
 my $go = 1; # boolean, should we be collecting and displaying data, or not?
-
-# -----------------------------------------------------------------------------------------------------------------
-#          data shared between threads
-# -----------------------------------------------------------------------------------------------------------------
-my @sound_data;
+my $pixels_per_channel_log2 = -1;
 
 # -----------------------------------------------------------------------------------------------------------------
 #          global data related to GUI
 # -----------------------------------------------------------------------------------------------------------------
+my @sound_data;
 my ($window,$area,$pixmap,%allocated_colors,$gc,$colormap);
 my @big_buff = (0) x $big_buff_size; # preallocate it for efficiency
 my $first_valid_small = 0;
@@ -78,7 +75,6 @@ print "reads will happen every ",((1./$sampling_rate)*$small_buff_size)," s,",
       " fft frame filled once every ",((1./$sampling_rate)*$small_buff_size)*$n_small_buffs," s",
       "\n";
 my $nyquist = $sampling_rate/2;
-my $f_hi = $nyquist; # as high as it can go
 
 # -----------------------------------------------------------------------------------------------------------------
 #          create, run, and destroy GUI
@@ -95,7 +91,12 @@ $event_source_tag = Glib::IO->add_watch(
     if ($go) {
       my $err = collect_sound();
       if ($err!=0) {die $err}
-      if (!$busy_drawing) {$busy_drawing=1; draw(); $busy_drawing=0}
+      my $spectrum;
+      if ($mode eq 'f') {
+        my $fft = Math::FFT->new(\@big_buff);
+        $spectrum = $fft->spctrm(); # has $big_buff_size/2+1 elements
+      }
+      if (!$busy_drawing) {$busy_drawing=1; draw($spectrum); $busy_drawing=0}
     }
     return 1;
   }
@@ -123,7 +124,6 @@ sub collect_sound {
   #print "nbytes=$nbytes, nread=$nread\n";
   @sound_data = unpack($template,$buff);
   put_new_data_in_circular_buffer();
-
   return 0;
 }
 
@@ -131,6 +131,7 @@ sub collect_sound {
 #          GUI
 # -----------------------------------------------------------------------------------------------------------------
 sub draw {
+  my $spectrum = shift; # can be undef if in time mode
   my $t1 = [Time::HiRes::gettimeofday];
 
   return if $mode eq 'f' && $n_valid_smalls<$n_small_buffs;
@@ -149,8 +150,10 @@ sub draw {
   $gc->set_foreground(get_color($colormap, 'white'));
   $pixmap->draw_rectangle($gc,1,0,0,$w,$h); # x,y,w,h
 
-  if ($mode eq 't') {draw_time_mode($colormap,$gc,$w,$h)}
-  if ($mode eq 'f') {draw_freq_mode($colormap,$gc,$w,$h,0,$f_hi)}
+  if ($mode eq 't') {draw_time_mode($pixmap,$colormap,$gc,$w,$h)}
+  if ($mode eq 'f') {
+    draw_freq_mode($spectrum,$pixmap,$colormap,$gc,$w,$h,0,$pixels_per_channel_log2);
+  }
 
   #without this line the screen won't be updated until a screen action
   $area->queue_draw; # "Once the main loop becomes idle (after the current batch of events has been processed, roughly), the window will receive expose events for the union of all regions that have been invalidated."
@@ -167,21 +170,20 @@ sub draw {
 }
 
 sub draw_freq_mode {
-  my ($colormap,$gc,$w,$h,$f_lo,$f_hi) = @_; #w=width, h=height, in pixels
+  my ($spectrum,$pixmap,$colormap,$gc,$w,$h,$f_lo,$pixels_per_channel_log2) = @_; #w=width, h=height, in pixels
  
   my $t1 = [Time::HiRes::gettimeofday];
 
   my $n_spectrum = $big_buff_size/2;
 
-  my $spectrum;
-  my $fft = Math::FFT->new(\@big_buff);
-  $spectrum = $fft->spctrm(); # has $big_buff_size/2+1 elements
+  my $pixels_per_channel = 1;
+  if ($pixels_per_channel_log2>0) {$pixels_per_channel = 1<<$pixels_per_channel_log2}
+  if ($pixels_per_channel_log2<0) {$pixels_per_channel = 1./(1<<(-$pixels_per_channel_log2))}
+  my $f_hi = $f_lo + $nyquist*$w/$big_buff_size/$pixels_per_channel; # one pixel per channel
 
-  my $x_shift = 1;
-  while (($big_buff_size<<$x_shift)<$w/2) {++$x_shift}
   my $scale_x = sub {
     my $x = shift;
-    return int($x)<<$x_shift;
+    return bit_shift_left(int($x),$pixels_per_channel_log2);
   };
 
   my $scale = sub {
@@ -199,7 +201,7 @@ sub draw_freq_mode {
   };
 
   #---- Draw scale and grid.
-  draw_frequency_scale_and_grid($gc,$pixmap,$sampling_rate,$scale_x,$w,$h,$big_buff_size);
+  draw_frequency_scale_and_grid($gc,$pixmap,$f_lo,$f_hi,$scale_x,$w,$h,$big_buff_size);
   #---- Draw spectrum.
   $gc->set_foreground(get_color($colormap, 'black'));
   my ($prev_x,$prev_y) = &$scale(0,0);
@@ -223,14 +225,15 @@ sub draw_freq_mode {
 }
 
 sub draw_frequency_scale_and_grid {
-  my ($gc,$pixmap,$sampling_rate,$scale_x,$w,$h,$big_buff_size) = (@_);
+  my ($gc,$pixmap,$f_lo,$f_hi,$scale_x,$w,$h,$big_buff_size) = (@_);
   $gc->set_foreground(get_color($colormap, 'gray'));
-  my $nyquist = $sampling_rate/2.;
   my $scale_factor = &$scale_x(1000)/1000.;
-  my $top_f_displayed = $nyquist*$w/($scale_factor*$big_buff_size);
-  my $grid_interval = optimal_grid_spacing($top_f_displayed);
+  my $freq_range = $f_hi-$f_lo;
+  my $grid_interval = optimal_grid_spacing($freq_range);
   my $layout = make_text_layout();
-  for (my $f=$grid_interval; $f<$top_f_displayed; $f+=$grid_interval) {
+  my $f1 = (int($f_lo/$grid_interval)+1)*$grid_interval;
+  #print "f_lo=$f_lo f_hi=$f_hi f1=$f1 grid_interval=$grid_interval nyquist=$nyquist\n";
+  for (my $f=$f1; $f<$f_hi; $f+=$grid_interval) {
     my $k = ($f/$nyquist)*$big_buff_size;
     my $x = &$scale_x($k);
     last if $x>$w;
@@ -272,7 +275,7 @@ sub optimal_grid_spacing {
 }
 
 sub draw_time_mode {
-  my ($colormap,$gc,$w,$h) = @_; #w=width, h=height
+  my ($pixmap,$colormap,$gc,$w,$h) = @_; #w=width, h=height
 
   my $i1 = $first_valid_small*$small_buff_size;
   my $n_samples = $n_valid_smalls*$small_buff_size;
@@ -493,17 +496,32 @@ my $hbox1 = Gtk2::HBox->new( 0, 0 );
 $vbox->pack_start($hbox1,0,0,0);
 $hbox1->set_border_width(2);
 
-my $button1 = Gtk2::Button->new('Start/Stop');
-$hbox1->pack_start( $button1, FALSE, FALSE, 2);
-$button1->signal_connect( clicked => sub {
-  $go = !$go;
-  if (!$go) {
-    close_sound_input($dsp);
-  }
-  else {
-    start_sound_input();
-  }
-});
+my %buttons = (
+  'Start/Stop' => sub {
+    $go = !$go;
+    if (!$go) {
+      close_sound_input($dsp);
+    }
+    else {
+      start_sound_input();
+    }
+  },
+  'Frequency/Time' => sub {
+    if ($mode eq 'f') {$mode = 't'} else {$mode = 'f'}
+  },
+  'Zoom In' => sub {
+    if ($pixels_per_channel_log2<6) {++$pixels_per_channel_log2}
+  },
+  'Zoom Out' => sub {
+    if ($pixels_per_channel_log2>-3) {--$pixels_per_channel_log2}
+  },
+);
+
+foreach my $label(reverse keys %buttons) {
+  my $button = Gtk2::Button->new($label);
+  $hbox1->pack_start($button, FALSE, FALSE, 2);
+  $button->signal_connect(clicked => $buttons{$label});
+}
 
 # Create the drawing area.
 $area = new Gtk2::DrawingArea; #don't confuse with Gtk2::Drawable
@@ -523,10 +541,12 @@ $area->signal_connect( configure_event => \&configure_event );
 
 $window->show_all;
 }
+
 # -----------------------------------------------------------------------------------------------------------------
 #          misc
 # -----------------------------------------------------------------------------------------------------------------
-sub warning {
-  my $message = shift;
-  print STDERR $message,"\n";
+sub bit_shift_left {
+  my $x = shift;
+  my $n = shift;
+  if ($n>0) {return $x<<$n} else {return $x>>(-$n)}
 }
