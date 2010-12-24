@@ -48,7 +48,12 @@ my $sample_size_bytes = 2; # only 2 works
 my $mode = 'f'; # can be 'f' (frequency) or 't' (time)
 
 my $go = 1; # boolean, should we be collecting and displaying data, or not?
+
 my $pixels_per_channel_log2 = -1;
+my $f_lo = 0;
+my $closeup = 0;
+my $save_pixels_per_channel_log2; # for use when exiting closeup
+my $save_f_lo; # for use when exiting closeup
 
 # -----------------------------------------------------------------------------------------------------------------
 #          global data related to GUI
@@ -131,9 +136,11 @@ sub collect_sound {
 #          GUI
 # -----------------------------------------------------------------------------------------------------------------
 sub draw {
+  my $force = 0;
+  if (@_) {$force = shift}
   my $t1 = [Time::HiRes::gettimeofday];
 
-  return if $mode eq 'f' && $n_valid_smalls<$n_small_buffs;
+  return if $mode eq 'f' && $n_valid_smalls<$n_small_buffs && !$force;
 
   # get current window size and freeze it, so x y scaling is constant in the pixmap
   my (undef, undef, $width0, $height0, undef) = $window->window->get_geometry;
@@ -151,7 +158,7 @@ sub draw {
 
   if ($mode eq 't') {draw_time_mode($pixmap,$colormap,$gc,$w,$h)}
   if ($mode eq 'f') {
-    draw_freq_mode($spectrum,$pixmap,$colormap,$gc,$w,$h,0,$pixels_per_channel_log2);
+    draw_freq_mode($spectrum,$pixmap,$colormap,$gc,$w,$h,$f_lo,$pixels_per_channel_log2);
   }
 
   #without this line the screen won't be updated until a screen action
@@ -517,10 +524,10 @@ my %buttons = (
     if ($mode eq 'f') {$mode = 't'} else {$mode = 'f'}
   },
   'Zoom In' => sub {
-    if ($pixels_per_channel_log2<6) {++$pixels_per_channel_log2; draw()}
+    if ($pixels_per_channel_log2<6) {++$pixels_per_channel_log2; draw(1)}
   },
   'Zoom Out' => sub {
-    if ($pixels_per_channel_log2>-3) {--$pixels_per_channel_log2; draw()}
+    if ($pixels_per_channel_log2>-3) {--$pixels_per_channel_log2; draw(1)}
   },
 );
 
@@ -541,8 +548,24 @@ $area->set_events ([qw/exposure-mask
 		       pointer-motion-hint-mask/]);
 
 $area->signal_connect (button_press_event => sub {
-  my $event = shift;
-  print "button, ",ref($event),"\n";
+  my $drawing_area = shift;
+  my $event = shift; # Gtk2::Gdk::Event::Button
+  my $x = $event->x;
+  $closeup = !$closeup;
+  if ($closeup) {
+    my (undef, undef, $w, undef, undef) = $drawing_area->window->get_geometry;
+    my $chan = bit_shift_left(int($x),-$pixels_per_channel_log2); # how many channels above f_lo did they click?
+    $save_f_lo = $f_lo;
+    my $f_center = $f_lo + $chan*$nyquist/$big_buff_size;
+    $save_pixels_per_channel_log2 = $pixels_per_channel_log2;
+    $pixels_per_channel_log2 = 4;
+    $f_lo = $f_center - .5*$nyquist*($w/(1<<$pixels_per_channel_log2))/$big_buff_size;    
+  }
+  else {
+    $pixels_per_channel_log2 = $save_pixels_per_channel_log2;
+    $f_lo = $save_f_lo;
+  }
+  draw(1);
 });
 # Signals used to handle backing pixmap
 $area->signal_connect( expose_event    => \&expose_event );
