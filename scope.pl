@@ -54,7 +54,10 @@ my $f_lo = 0;
 my $closeup = 0;
 my $save_pixels_per_channel_log2; # for use when exiting closeup
 my $save_f_lo; # for use when exiting closeup
-
+my $log_power_scale = 0; # boolean
+# avoid sudden changes in y scale in frequency mode:
+my $old_y_scale;
+my $old_noise;
 # -----------------------------------------------------------------------------------------------------------------
 #          global data related to GUI
 # -----------------------------------------------------------------------------------------------------------------
@@ -192,13 +195,18 @@ sub draw_freq_mode {
     my $chan = shift;
     return bit_shift_left(int($chan),$pixels_per_channel_log2);
   };
+  my $chan_hi = max_chan_visible($w,$pixels_per_channel_log2,$scale_x,$chan_lo);
+  my ($max,$noise,$y_scale) = autoscale_power_spectrum($spectrum,$chan_lo,$f_hi,$big_buff_size,$scale_x,$w,$h,$chan_hi); # returns undef if spectrum is undef
+
+  my $bottom_of_log_scale = sqrt($noise/10.)*$y_scale;
+  my $log_bottom_of_log_scale = log($bottom_of_log_scale); # guaranteed not to be <= 0
 
   my $scale = sub {
     my ($x,$y) = @_;
-    my $u = sqrt($y)*.001; # if u=0 to 1, it's in range
-    if (0) { # optional logarithmic rescaling
-      if ($u>0) {
-        $u = 1.+(log($u)/log(10.))/2.;
+    my $u = sqrt($y)*$y_scale; # if u=0 to 1, it's in range
+    if ($log_power_scale) { # optional logarithmic rescaling
+      if ($u>$bottom_of_log_scale) {
+        $u = (log($u)-$log_bottom_of_log_scale)/(-$log_bottom_of_log_scale);
       }
       else {
         $u=0;
@@ -207,8 +215,8 @@ sub draw_freq_mode {
     return (&$scale_x($x),$h-int($h*$u));
   };
 
-  draw_frequency_scale_and_grid($gc,$pixmap,$f_lo,$f_hi,$scale_x,$w,$h,$big_buff_size,$chan_lo);
-  draw_spectrum($spectrum,$gc,$pixmap,$f_lo,$f_hi,$scale_x,$scale,$w,$h,$big_buff_size,$chan_lo) if defined $spectrum;
+  draw_frequency_scale_and_grid($gc,$pixmap,$f_lo,$f_hi,$scale_x,$w,$h,$big_buff_size,$chan_lo,$chan_hi);
+  draw_spectrum($spectrum,$gc,$pixmap,$f_lo,$f_hi,$scale_x,$scale,$w,$h,$big_buff_size,$chan_lo,$chan_hi);
 
   my $t2 = [Time::HiRes::gettimeofday];
   #print "fft and drawing took ",Time::HiRes::tv_interval($t1,$t2)," s\n";
@@ -218,26 +226,79 @@ sub draw_freq_mode {
   $n_valid_smalls = 0;
 }
 
+sub max_chan_visible {
+  my ($w,$pixels_per_channel_log2,$scale_x,$chan_lo) = @_;
+  my $chan = bit_shift_left(int($w),-$pixels_per_channel_log2)+$chan_lo;
+  while (&$scale_x($chan-$chan_lo)<$w) {++$chan}
+  while (&$scale_x($chan-$chan_lo)>$w && $chan>$chan_lo) {--$chan}
+  return $chan;
+}
+
+sub autoscale_power_spectrum {
+  my ($spectrum,$chan_lo,$f_hi,$big_buff_size,$scale_x,$w,$h,$chan_hi)  = @_;
+  return if !defined $spectrum;
+  # find maximum:
+  my $max = 0;
+  my $max_k;
+  my $lo_for_max = $chan_lo;
+  # Look for the maximum value, with a high-pass filter because we tend to get a big noise peak at DC.
+  for (my $k=$lo_for_max; $k<$chan_hi; $k++) {
+    if ($spectrum->[$k]*$k>$max) {$max=$spectrum->[$k]*$k; $max_k=$k}
+  }
+  $max = $max/$max_k;
+  # Find approximate median (only using a random sample of channels, since the sort is a slow n log n operation).
+  # It's referred to as median in code and comments, but actually I use the 25th percentile.
+  # The median is typically somewhere in the middle of the noise.
+  my @random_sample = ();
+  my $step = 7; # pick an odd number to avoid possible special behavior of powers of 2
+  while (($chan_hi-$chan_lo)/$step<100 && $step>1) { # but choose a smaller step if it would result in a sample size of less than 100
+    $step = ($step+1)/2-1;
+  }
+  for (my $k=$chan_lo; $k<$chan_hi; $k+=7) {
+    push @random_sample,[$k,$spectrum->[$k]];
+  }
+  @random_sample = sort {$a->[1]*$a->[0] <=> $b->[1]*$b->[0]} @random_sample; # multiplication is high-pass filter
+  my $median = $random_sample[int(@random_sample/4)]->[1]; # labeled as the median, but is really the 25th percentile
+  # Never make the max go off the screen. But when the input is quiet, we don't want to scale it up so much that the noise looks gigantic. If the input
+  # consists of sound interspersed with silence, we don't want crazy, abrupt changes in scale. The median, which is a measure of background noise,
+  # should stay fairly constant. The median can also be useful in setting the bottom of a log scale. We're doing our computations in this subroutine using
+  # the power spectrum, but the scale factor will be applied to the square root of the power spectrum, which is what's actually displayed.
+  # The output $y_scale is supposed to be such that when it's multiplied by sqrt(power), the result is between 0 and 1 for the visible portion of the graph.
+  my $y_scale = 1./(100.*sqrt($median+1.)); # make the noise about 1/400 of the full scale; for typical s/n ratios, this makes noise visible across the board
+  my $overload = sqrt($max)*$y_scale; # If this is >1, then the biggest peak is too high
+  if ($overload>1.) {$y_scale /= $overload}
+  if ($median<=1.) {$median=1.} # we take log of it, so don't let it be zero
+
+  # change scale smoothly, not abruptly:
+  if (defined $old_y_scale) { 
+    my $decay=.25;
+    $y_scale = (1.-$decay)*$old_y_scale+$decay*$y_scale;
+    $median  = (1.-$decay)*$old_noise  +$decay*$median;
+  } 
+  $old_y_scale = $y_scale;
+  $old_noise   = $median;
+
+  return ($max,$median,$y_scale);
+}
+
 sub draw_spectrum {
-  my ($spectrum,$gc,$pixmap,$f_lo,$f_hi,$scale_x,$scale,$w,$h,$big_buff_size,$chan_lo) = @_;
+  my ($spectrum,$gc,$pixmap,$f_lo,$f_hi,$scale_x,$scale,$w,$h,$big_buff_size,$chan_lo,$chan_hi) = @_;
   return if !defined $spectrum;
   $gc->set_foreground(get_color($colormap, 'black'));
   my ($prev_x,$prev_y) = &$scale(0,0);
-  my $max_k = (@$spectrum)-1;
-  for (my $k=$chan_lo; $k<$max_k; $k++) {
+  for (my $k=$chan_lo; $k<$chan_hi; $k++) {
     my $power = $spectrum->[$k];
     my ($x,$y) = &$scale($k-$chan_lo,$power);
     if ($k>$chan_lo) {
       $pixmap->draw_rectangle($gc,1,$prev_x,$prev_y,($x-$prev_x),($h-$prev_y));
     }
-    last if $x>$w;
     ($prev_x,$prev_y) =($x,$y);
-    ++$k;
+    #++$k; # fixme !?!?!?!!!!!!!!!!!!!!!!!!!!!!!!!!!!! incs twice
   }
 }
 
 sub draw_frequency_scale_and_grid {
-  my ($gc,$pixmap,$f_lo,$f_hi,$scale_x,$w,$h,$big_buff_size,$chan_lo) = @_;
+  my ($gc,$pixmap,$f_lo,$f_hi,$scale_x,$w,$h,$big_buff_size,$chan_lo,$chan_hi) = @_;
   $gc->set_foreground(get_color($colormap, 'gray'));
   my $scale_factor = &$scale_x(1000)/1000.;
   my $freq_range = $f_hi-$f_lo;
@@ -510,8 +571,8 @@ my $hbox1 = Gtk2::HBox->new( 0, 0 );
 $vbox->pack_start($hbox1,0,0,0);
 $hbox1->set_border_width(2);
 
-my %buttons = (
-  'Start/Stop' => sub {
+my @buttons = (
+  ['Freeze/Go', sub {
     $go = !$go;
     if (!$go) {
       close_sound_input($dsp);
@@ -519,28 +580,31 @@ my %buttons = (
     else {
       start_sound_input();
     }
-  },
-  'Frequency/Time' => sub {
-    if ($mode eq 'f') {$mode = 't'} else {$mode = 'f'}
-  },
-  'Zoom In' => sub {
+  }],
+  ['Frequency/Time' , sub {
+    if ($mode eq 'f') {$mode = 't'; $old_y_scale = undef; $old_noise=undef} else {$mode = 'f'}
+  }],
+  ['Zoom In' , sub {
     if ($pixels_per_channel_log2<6) {++$pixels_per_channel_log2; draw(1)}
-  },
-  'Zoom Out' => sub {
+  }],
+  ['Zoom Out' , sub {
     if ($pixels_per_channel_log2>-3) {--$pixels_per_channel_log2; draw(1)}
-  },
+  }],
+  ['Log/Linear Y' , sub {
+    if ($mode eq 'f') {$log_power_scale=!$log_power_scale; draw(1)}
+  }],
 );
 
-foreach my $label(reverse keys %buttons) {
+foreach my $b(@buttons) {
+  my ($label,$sub) = @$b;
   my $button = Gtk2::Button->new($label);
   $hbox1->pack_start($button, FALSE, FALSE, 2);
-  $button->signal_connect(clicked => $buttons{$label});
+  $button->signal_connect(clicked => $sub);
 }
 
 # Create the drawing area.
 $area = new Gtk2::DrawingArea; #don't confuse with Gtk2::Drawable
 $hbox->pack_start($area,1,1,0);
-
 $area->set_events ([qw/exposure-mask
          	       leave-notify-mask
 		       button-press-mask
