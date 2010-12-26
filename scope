@@ -3,6 +3,31 @@
 
 # This program includes code by zentara, http://www.perlmonks.org/?node_id=583578
 
+#----------------------------------------------------------------
+# Long documentation
+#
+# The man page is generated from this, using pod2man.
+#----------------------------------------------------------------
+
+=head1 NAME
+
+Scope - a software oscilloscope for time and frequency domains
+
+=head1 AUTHOR
+
+B<Scope> was written by Ben Crowell, http://www.lightandmatter.com/personal/.
+It incorporates some sample code posted by perlmonks user zentara.
+
+=head1 COPYRIGHT AND LICENSE
+
+B<Copyright (C)> 2010 by Benjamin Crowell.
+
+B<Scope> is free software; you can redistribute it and/or modify it
+under the terms of the GPL, or, optionally, Perl's license.
+
+=cut
+
+
 use warnings;
 use strict;
 use Glib qw/TRUE FALSE/;
@@ -58,6 +83,7 @@ my $log_power_scale = 0; # boolean
 # avoid sudden changes in y scale in frequency mode:
 my $old_y_scale;
 my $old_noise;
+my $old_y_scale_time = undef;
 # -----------------------------------------------------------------------------------------------------------------
 #          global data related to GUI
 # -----------------------------------------------------------------------------------------------------------------
@@ -270,13 +296,17 @@ sub autoscale_power_spectrum {
   if ($median<=1.) {$median=1.} # we take log of it, so don't let it be zero
 
   # change scale smoothly, not abruptly:
-  if (defined $old_y_scale) { 
-    my $decay=.25;
+  my $t = [Time::HiRes::gettimeofday];
+  if (defined $old_y_scale_time) { 
+    my $delta_t = Time::HiRes::tv_interval($old_y_scale_time,$t);
+    my $decay=1.5*$delta_t;
+    if ($decay>1) {$decay=1.}
     $y_scale = (1.-$decay)*$old_y_scale+$decay*$y_scale;
     $median  = (1.-$decay)*$old_noise  +$decay*$median;
   } 
   $old_y_scale = $y_scale;
   $old_noise   = $median;
+  $old_y_scale_time = $t;
 
   return ($max,$median,$y_scale);
 }
@@ -582,7 +612,7 @@ my @buttons = (
     }
   }],
   ['Frequency/Time' , sub {
-    if ($mode eq 'f') {$mode = 't'; $old_y_scale = undef; $old_noise=undef} else {$mode = 'f'}
+    if ($mode eq 'f') {$mode = 't'; $old_y_scale_time = undef; $old_noise=undef} else {$mode = 'f'}
   }],
   ['Zoom In' , sub {
     if ($pixels_per_channel_log2<6) {++$pixels_per_channel_log2; draw(1)}
