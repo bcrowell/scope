@@ -1,8 +1,6 @@
 #!/usr/bin/perl
 
 
-# This program includes code by zentara, http://www.perlmonks.org/?node_id=583578
-
 #----------------------------------------------------------------
 # Long documentation
 #
@@ -13,23 +11,44 @@
 
 Scope - a software oscilloscope for time and frequency domains
 
+=head1 INSTALLING
+
+Scope should run on any unixlike system, such as linux or FreeBSD. It depends on the gtk2-perl
+library, which can be installed on a Debian or Ubuntu system by doing:
+
+	sudo apt-get install gtk2-perl
+
+Then install Scope itself by doing:
+
+	sudo make install
+
+Frequency mode will not work unless you also have the Math::FFT library installed. For convenience,
+a copy of this library is packaged with Scope and is installed automatically if you don't already
+have a copy installed.
+
+=head1 USE
+
+To run the program, just type "scope" at the command line. It starts up in frequency mode by default,
+displaying a sound spectrum from the microphone input (/dev/dsp on a unixlike system).
+
+In either frequency mode or time mode, you can click on the Freeze/Go button to freeze the display,
+and then again to start collecting data again. The Frequency/Time button toggles back and forth
+between frequency mode and time mode.
+
+In frequency mode, the x axis is frequency and the y axis is the absolute value of amplitude.
+You can switch the y axis between linear and log scale by clicking on Log/Linear Y.
+You can change the frequency region that's displayed either by using the Zoom In and Zoom Out
+buttons or by clicking on the graph to get an extreme close-up of that region and then clicking
+again to see everything.
+
+Time mode is currently very primitive. There is no control over the x and y scales, and no provision
+for triggering.
+
 =head1 AUTHOR
 
 B<Scope> was written by Ben Crowell, http://www.lightandmatter.com/personal/.
-It incorporates some sample code posted by perlmonks user zentara.
-
-=head1 INSTALLING
-
-B<Scope> should run on any unixlike system, such as linux or FreeBSD. To install it,
-first install the Math::FFT module from CPAN by doing this command in a terminal window:
-
-	sudo cpan Math::FFT
-
-If this is your first time running the CPAN interface, it will ask you a bunch of questions.
-You can just hit return to accept the defaults for all of them, except for the ones about your
-geographical location. Next, install B<Scope> itself by doing
-
-	sudo make install
+It incorporates some sample code by perlmonks user zentara at
+http://www.perlmonks.org/?node_id=583578.
 
 =head1 COPYRIGHT AND LICENSE
 
@@ -37,6 +56,8 @@ B<Copyright (C)> 2010 by Benjamin Crowell.
 
 B<Scope> is free software; you can redistribute it and/or modify it
 under the terms of the GPL, or, optionally, Perl's license.
+
+For copyright information on Math::FFT, see http://search.cpan.org/~rkobes/Math-FFT-1.28/FFT.pm.
 
 =cut
 
@@ -47,13 +68,11 @@ use Glib qw/TRUE FALSE/;
 use Gtk2 -init;
 use IO::File;
 use Time::HiRes;
-use Math::FFT;
 
 # Notes on moving average:
-#   Looking at fftexplorer's source code, it looks like it simply averages the complex amplitudes of n frames, and that's what I've done here.
+#   Looking at fftexplorer's source code, it looks like it simply averages the complex amplitudes of n frames.
 #   But actually that doesn't make much sense. For any given frequency f, there is a known phase relationship between one frame and the next.
 #   This should be taken into account, and in fact by the time you've done that, you've really just made the fft frame bigger. So why not just do that?
-#   Removed moving average code for this reason.
 
 # The following are from Audio::OSS's Constants.pm, which is constructed by its Makefile.PL by compiling a C program that #includes soundfile.h.
 # This works on intel (little-endian). I think these might have to be swapped to work on ARM (which can be either little- or big-endian).
@@ -140,8 +159,8 @@ $event_source_tag = Glib::IO->add_watch(
       my $err = collect_sound();
       if ($err!=0) {die $err}
       if ($mode eq 'f') {
-        my $fft = Math::FFT->new(\@big_buff);
-        $spectrum = $fft->spctrm(); # has $big_buff_size/2+1 elements
+        my $fft = do_fft(\@big_buff);
+        $spectrum = $fft->spctrm() if defined $fft; # $spectrum has $big_buff_size/2+1 elements
       }
       if (!$busy_drawing) {$busy_drawing=1; draw(); $busy_drawing=0}
     }
@@ -175,7 +194,7 @@ sub collect_sound {
 }
 
 # -----------------------------------------------------------------------------------------------------------------
-#          GUI
+#          drawing
 # -----------------------------------------------------------------------------------------------------------------
 sub draw {
   my $force = 0;
@@ -219,6 +238,11 @@ sub draw {
 
 sub draw_freq_mode {
   my ($spectrum,$pixmap,$colormap,$gc,$w,$h,$f_lo,$pixels_per_channel_log2) = @_; #w=width, h=height, in pixels
+
+  if (!defined $spectrum) {
+    if (!fft_installed()) {error_message($gc,$h,['For frequency mode you need to install Math::FFT.','You can do this using the command "sudo make fft".']);}
+    return;
+  }
  
   my $t1 = [Time::HiRes::gettimeofday];
 
@@ -336,7 +360,6 @@ sub draw_spectrum {
       $pixmap->draw_rectangle($gc,1,$prev_x,$prev_y,($x-$prev_x),($h-$prev_y));
     }
     ($prev_x,$prev_y) =($x,$y);
-    #++$k; # fixme !?!?!?!!!!!!!!!!!!!!!!!!!!!!!!!!!!! incs twice
   }
 }
 
@@ -442,6 +465,19 @@ sub draw_time_mode {
   $n_valid_smalls = 0;
 
 }
+
+sub error_message {
+  my ($gc,$h,$lines) = @_;
+  $gc->set_foreground(get_color($colormap, 'red'));
+  my $layout = make_text_layout();
+  my $y = $h/2;
+  foreach my $line(@$lines) {
+    $layout->set_text ($line);
+    $pixmap->draw_layout($gc,30,$y,$layout);
+    $y += 30;
+  }
+}
+
 
 sub put_new_data_in_circular_buffer {
   # Splice the newly collected small buffer into the large circular buffer.
@@ -599,23 +635,38 @@ my ($x0,$y0,$x1,$y1,$width,) = (0,0,0,0);
 $window = new Gtk2::Window ( "toplevel" );
 $window->signal_connect ("delete_event", sub { turn_off_sound_input(); Gtk2->main_quit; });
 $window->set_border_width (10);
-$window->set_size_request(1024+28,480); # oscilloscope area comes out 1024 pixels wide on my system
+$window->set_size_request(1024+28,800); # oscilloscope area comes out 1024 pixels wide on my system
 $window->set_position('center');
 
 my $vbox = Gtk2::VBox->new( 0, 0 );
 $window->add($vbox);
 $vbox->set_border_width(2);
 
-my $hbox = Gtk2::HBox->new( 0, 0 );
-$vbox->pack_start($hbox,1,1,0);
-$hbox->set_border_width(2);
+# hbox constructor: (homogeneous,spacing) # http://www.pygtk.org/docs/pygtk/class-gtkhbox.html
+# pack_start: (child,expand,fill,padding) # http://www.pygtk.org/docs/pygtk/class-gtkbox.html
 
-my $hbox1 = Gtk2::HBox->new( 0, 0 );
-$vbox->pack_start($hbox1,0,0,0);
-$hbox1->set_border_width(2);
+my ($graph_hbox,$general_buttons_hbox,$y_buttons_hbox,$x_buttons_hbox);
+my @hboxes = (
+  {'homogeneous'=>0,'spacing'=>0,'expand'=>1,'fill'=>1,'padding'=>1,'border_width'=>2,'var'=>\$graph_hbox},
+  {'homogeneous'=>0,'spacing'=>0,'expand'=>0,'fill'=>0,'padding'=>0,'border_width'=>2,'var'=>\$general_buttons_hbox,'label'=>'General'},
+  {'homogeneous'=>0,'spacing'=>0,'expand'=>0,'fill'=>0,'padding'=>0,'border_width'=>2,'var'=>\$y_buttons_hbox,'label'=>'Y Axis'},
+  {'homogeneous'=>0,'spacing'=>0,'expand'=>0,'fill'=>0,'padding'=>0,'border_width'=>2,'var'=>\$x_buttons_hbox,'label'=>'X Axis'},
+);
+
+foreach my $d(@hboxes) {
+  my $hbox = $d->{'var'};
+  $$hbox = Gtk2::HBox->new( $d->{homogeneous},$d->{spacing} );
+  $vbox->pack_start($$hbox,$d->{expand},$d->{fill},$d->{padding});
+  $$hbox->set_border_width($d->{border_width});
+  if (exists $d->{label}) {
+    my $label = Gtk2::Label->new ();
+    $label->set_markup('<span weight="bold">'.($d->{label})."</span>");
+    $$hbox->pack_start($label, FALSE, FALSE, 2);
+  }
+}
 
 my @buttons = (
-  ['Freeze/Go', sub {
+  ['Freeze/Go', \$general_buttons_hbox, sub {
     $go = !$go;
     if (!$go) {
       close_sound_input($dsp);
@@ -624,30 +675,30 @@ my @buttons = (
       start_sound_input();
     }
   }],
-  ['Frequency/Time' , sub {
+  ['Frequency/Time' , \$x_buttons_hbox, sub {
     if ($mode eq 'f') {$mode = 't'; $old_y_scale_time = undef; $old_noise=undef} else {$mode = 'f'}
   }],
-  ['Zoom In' , sub {
+  ['Zoom In' , \$x_buttons_hbox, sub {
     if ($pixels_per_channel_log2<6) {++$pixels_per_channel_log2; draw(1)}
   }],
-  ['Zoom Out' , sub {
+  ['Zoom Out' , \$x_buttons_hbox, sub {
     if ($pixels_per_channel_log2>-3) {--$pixels_per_channel_log2; draw(1)}
   }],
-  ['Log/Linear Y' , sub {
+  ['Log/Linear Y' , \$y_buttons_hbox, sub {
     if ($mode eq 'f') {$log_power_scale=!$log_power_scale; draw(1)}
   }],
 );
 
 foreach my $b(@buttons) {
-  my ($label,$sub) = @$b;
+  my ($label,$hbox,$sub) = @$b;
   my $button = Gtk2::Button->new($label);
-  $hbox1->pack_start($button, FALSE, FALSE, 2);
+  $$hbox->pack_start($button, FALSE, FALSE, 2);
   $button->signal_connect(clicked => $sub);
 }
 
 # Create the drawing area.
 $area = new Gtk2::DrawingArea; #don't confuse with Gtk2::Drawable
-$hbox->pack_start($area,1,1,0);
+$graph_hbox->pack_start($area,1,1,0);
 $area->set_events ([qw/exposure-mask
          	       leave-notify-mask
 		       button-press-mask
@@ -689,4 +740,18 @@ sub bit_shift_left {
   my $x = shift;
   my $n = shift;
   if ($n>0) {return $x<<$n} else {return $x>>(-$n)}
+}
+
+sub do_fft {
+  my $data = shift;
+  if (fft_installed()) {
+    return Math::FFT->new($data);
+  }
+  else {
+    return undef;
+  }
+}
+
+sub fft_installed {
+  if (eval("require Math::FFT;") ) {return 1} else {return 0}
 }

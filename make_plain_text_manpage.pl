@@ -1,11 +1,12 @@
 #!/usr/bin/perl
 use strict;
 
+my $version = "0.1.1";
+
 my $man = `nroff -man scope.1`;
 $man =~ s/(.)\x{08}./$1/g;
 $man =~ s/[^ \w,.\-:;'"()[]{}<>+=|\\`~!?\/@#$%^&*_]//g;
 
-my $version = "0.1";
 $version =~ m/((\d+\.)+\d+)/;
 $version = $1;
 # ... same logic as in Makefile
