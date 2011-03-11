@@ -96,9 +96,11 @@ my %dsp_constant = (
 #   $big_buff_size is also the size of the fft frame.
 #   The defaults is $big_buff_size=8192=2^13, which was the default in fftexplorer and seems to work well.
 
-my $small_buff_size_log2 = 9;       # normally 9; if too small, may get bogged down by gtk events
+# The circular buffer stuff was for my old method of hooking up sound input to GUI. In the present setup, the circular buffer is not needed, and
+# doesn't work properly unless $n_small_buffs_log2 is set to 0.
+my $small_buff_size_log2 = 13;       # normally 9; if too small, may get bogged down by gtk events
                                     # In my current implementation of time mode, this also affects how long a trace can be.
-my $n_small_buffs_log2 = 4;         # normally 4; making this bigger makes fft (logarithmically) slower, but increases frequency resolution
+my $n_small_buffs_log2 = 0;         # normally 4; making this bigger makes fft (logarithmically) slower, but increases frequency resolution
 
 my $small_buff_size = (1<<$small_buff_size_log2);
 my $n_small_buffs = (1<<$n_small_buffs_log2);
@@ -248,7 +250,7 @@ sub accept_sound_from_child {
   my $nread = read(F,$buff,$nbytes);
   close F;
   if ($nread != $nbytes) {return "read $nread bytes from $sound_file, expected $nbytes"}
-  #print "nbytes=$nbytes, nread=$nread\n"; #qwe
+  #print "read stamp=$stamp\n"; #qwe
   @sound_data = unpack($template,$buff);
   #print "size of sound data = ".(@sound_data+0)."\n"; # qwe
   put_new_data_in_circular_buffer();
