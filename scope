@@ -29,7 +29,10 @@ have a copy installed.
 =head1 USE
 
 To run the program, just type "scope" at the command line. It starts up in frequency mode by default,
-displaying a sound spectrum from the microphone input (/dev/dsp on a unixlike system).
+displaying a sound spectrum from the microphone input (/dev/dsp on a unixlike system). If you get an
+error starting up the program in recent versions of Linux (e.g., Ubuntu 10.10), try
+using the command "aoss scope" to start it. Some versions of Linux, ubuntu 10.04 in particular, seem to have
+totally broken OSS support, and therefore will not work at all.
 
 In either frequency mode or time mode, you can click on the Freeze/Go button to freeze the display,
 and then again to start collecting data again. The Frequency/Time button toggles back and forth
@@ -132,7 +135,7 @@ my $n_valid_smalls = 0;
 my ($dsp,$error,$sampling_rate);
 sub start_sound_input {
   ($dsp,$error,$sampling_rate) = open_sound_input($desired_sampling_rate);
-  if ($error) {die "error opening sound input, $error"}
+  if ($error) {die "error opening sound input, $error."}
 }
 start_sound_input();
 
@@ -302,13 +305,13 @@ sub autoscale_power_spectrum {
   return if !defined $spectrum;
   # find maximum:
   my $max = 0;
-  my $max_k;
+  my $max_k = $chan_lo;
   my $lo_for_max = $chan_lo;
   # Look for the maximum value, with a high-pass filter because we tend to get a big noise peak at DC.
   for (my $k=$lo_for_max; $k<$chan_hi; $k++) {
     if ($spectrum->[$k]*$k>$max) {$max=$spectrum->[$k]*$k; $max_k=$k}
   }
-  $max = $max/$max_k;
+  $max = $spectrum->[$max_k];
   # Find approximate median (only using a random sample of channels, since the sort is a slow n log n operation).
   # It's referred to as median in code and comments, but actually I use the 25th percentile.
   # The median is typically somewhere in the middle of the noise.
@@ -328,7 +331,7 @@ sub autoscale_power_spectrum {
   # the power spectrum, but the scale factor will be applied to the square root of the power spectrum, which is what's actually displayed.
   # The output $y_scale is supposed to be such that when it's multiplied by sqrt(power), the result is between 0 and 1 for the visible portion of the graph.
   my $y_scale = 1./(100.*sqrt($median+1.)); # make the noise about 1/400 of the full scale; for typical s/n ratios, this makes noise visible across the board
-  my $overload = sqrt($max)*$y_scale; # If this is >1, then the biggest peak is too high
+  my $overload = sqrt($max)*$y_scale; # If this is >1, then the biggest peak is too high; overload=0 if sound input isn't working
   if ($overload>1.) {$y_scale /= $overload}
   if ($median<=1.) {$median=1.} # we take log of it, so don't let it be zero
 
@@ -560,7 +563,7 @@ sub open_sound_input {
   my $sampling_rate_desired = 48000; # default
   if (@_) {$sampling_rate_desired = shift}
 
-  my $dsp = new IO::File("</dev/dsp") or return(undef,"open failed: $!");
+  my $dsp = new IO::File("</dev/dsp") or return(undef,"open failed: $!. On recent versions of Linux, a workaround may be to run the program as 'aoss scope' rather than 'scope'.");
 
   dsp_reset($dsp) or return(undef,"reset failed: $!");
 

@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 use strict;
 
-my $version = "0.1.1";
+my $version = "0.1.2";
 
 my $man = `nroff -man scope.1`;
 $man =~ s/(.)\x{08}./$1/g;

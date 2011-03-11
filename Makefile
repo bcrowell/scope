@@ -9,12 +9,12 @@
 # need to rename it to something other than manpage.txt, alter the scope.source file to refer
 # to the new name, run M4.
 
-VERSION = 0.1.1
+VERSION = 0.1.2
 
 FFT_VERSION = 1.28
 FFT_TARBALL = Math-FFT-$(FFT_VERSION).tar.gz
 FFT_DIR = Math-FFT-$(FFT_VERSION)
-FILES = scope Makefile scope.1 $(FFT)
+FILES = scope Makefile scope.1 $(FFT_TARBALL)
 
 prefix=/usr
 exec_prefix=$(prefix)
