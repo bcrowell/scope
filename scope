@@ -70,6 +70,7 @@ use strict;
 use Glib qw/TRUE FALSE/;
 use Gtk2 -init;
 use IO::File;
+use Fcntl qw(:DEFAULT :flock);
 use Time::HiRes;
 
 # Notes on moving average:
@@ -104,10 +105,12 @@ my $n_small_buffs = (1<<$n_small_buffs_log2);
 my $big_buff_size = (1<<($n_small_buffs_log2+$small_buff_size_log2));
 
 my $desired_sampling_rate = 48000; # request most common native rate; this may get changed based on what the sound card actually is willing to set itself to
+my $sampling_rate = $desired_sampling_rate;
+my $nyquist = $sampling_rate/2;
 my $sample_size_bytes = 2; # only 2 works
 my $mode = 'f'; # can be 'f' (frequency) or 't' (time)
 
-my $go = 1; # boolean, should we be collecting and displaying data, or not?
+my $go = 1; # boolean, should we be displaying data, or not?
 
 my $pixels_per_channel_log2 = -1;
 my $f_lo = 0;
@@ -119,6 +122,7 @@ my $log_power_scale = 0; # boolean
 my $old_y_scale;
 my $old_noise;
 my $old_y_scale_time = undef;
+
 # -----------------------------------------------------------------------------------------------------------------
 #          global data related to GUI
 # -----------------------------------------------------------------------------------------------------------------
@@ -130,58 +134,107 @@ my $first_valid_small = 0;
 my $n_valid_smalls = 0;
 
 # -----------------------------------------------------------------------------------------------------------------
-#          open sound input
+#          set up semaphores and buffers for use by both sound and GUI processes
 # -----------------------------------------------------------------------------------------------------------------
-my ($dsp,$error,$sampling_rate);
-sub start_sound_input {
-  ($dsp,$error,$sampling_rate) = open_sound_input($desired_sampling_rate);
-  if ($error) {die "error opening sound input, $error."}
-}
-start_sound_input();
 
-print "actual sampling rate=$sampling_rate\n";
-print "small_buff_size=$small_buff_size   n_small_buffs=$n_small_buffs    big_buff_size=$big_buff_size \n";
-print "reads will happen every ",((1./$sampling_rate)*$small_buff_size)," s,",
+my $parent_pid = $$;
+my $tmp_file_prefix = "/tmp/scope_${parent_pid}_";
+my $child_error_file = $tmp_file_prefix."child_error";
+my $pointer_file = $tmp_file_prefix . "p";
+my $stop_file = $tmp_file_prefix . "stop";
+
+sub child_error {
+  my $message = shift;
+  open(F,">$child_error_file") or die "error opening child error file, $!";
+  print F $message;
+  close F;
+  print STDERR $message,"\n";
+  exit(-1);
+}
+
+sub clean_up {
+  system("rm -f ".$tmp_file_prefix."*");
+}
+
+clean_up();
+
+my $pid = fork; # camel book, p. 715
+my $fork_error  = (!defined $pid);
+my $i_am_child = !($pid || $fork_error);
+
+#print "parent_pid=$parent_pid, i_am_child=$i_am_child\n";
+
+# -----------------------------------------------------------------------------------------------------------------
+#          be the sound-collecting process
+# -----------------------------------------------------------------------------------------------------------------
+
+if ($i_am_child) {
+  my ($dsp,$error,$sampling_rate);
+  sub start_sound_input {
+    ($dsp,$error,$sampling_rate) = open_sound_input($desired_sampling_rate);
+    if ($error) {die "error opening sound input, $error; you may need to invoke the program with aoss as a prefix to get OSS emulation."}
+  }
+  start_sound_input();
+  if ($sampling_rate != $desired_sampling_rate) {die "desired_sampling_rate=$, sampling_rate=$sampling_rate; software needs a mechanism for communicating this back to the parent process"}
+
+  print "actual sampling rate=$sampling_rate\n";
+  print "small_buff_size=$small_buff_size   n_small_buffs=$n_small_buffs    big_buff_size=$big_buff_size \n";
+  print "reads will happen every ",((1./$sampling_rate)*$small_buff_size)," s,",
       " fft frame filled once every ",((1./$sampling_rate)*$small_buff_size)*$n_small_buffs," s",
       "\n";
-my $nyquist = $sampling_rate/2;
+
+  my $stamp = -1;
+  for (;;) {
+      if (-e $stop_file) {
+        close_sound_input($dsp);
+        while (-e $stop_file) {sleep .3}
+        start_sound_input();
+      }
+      if (getppid()==1) {exit(0)} # On unix, this means parent died. See camel book, p. 723.
+      my $buff = " " x $small_buff_size;
+      my $nbytes = $small_buff_size*$sample_size_bytes;
+      my $nread = read($dsp,$buff,$nbytes);
+      ++$stamp;
+      my $n = ($stamp % 2);
+      my $sound_file = $tmp_file_prefix . "b" . $n;
+      sysopen(F,$sound_file,O_WRONLY | O_CREAT) or child_error("error opening $sound_file for output, $!");
+      if (flock(F,LOCK_EX | LOCK_NB)) { # nonblocking request for an exclusive lock; camel book, p. 421
+        # lock succeeded; nobody else has any kind of lock on this file
+        truncate(F,0);
+        print F $buff;
+        open(F,">$pointer_file");
+        print F $stamp;
+        close F;
+      }
+      else {
+        # lock failed; do nothing and throw away sound data to avoid an underflow condition
+      }
+      close F;
+  }
+  exit(0);
+}
 
 # -----------------------------------------------------------------------------------------------------------------
-#          create, run, and destroy GUI
+#          be the GUI process: create, run, and destroy GUI
 # -----------------------------------------------------------------------------------------------------------------
+
+sub turn_off_sound_input {
+  open(F,">$stop_file");
+  close F;
+}
+
+sub turn_on_sound_input {
+  unlink $stop_file;
+}
+
 gui_setup();
 my $event_source_tag;
 my $count = 0;
 STDOUT->autoflush(1);
 my $busy_drawing = 0;
-$event_source_tag = Glib::IO->add_watch(
-  fileno($dsp),
-  'in',
-  sub {
-    if ($go) {
-      my $err = collect_sound();
-      if ($err!=0) {die $err}
-      if ($mode eq 'f') {
-        my $fft = do_fft(\@big_buff);
-        $spectrum = $fft->spctrm() if defined $fft; # $spectrum has $big_buff_size/2+1 elements
-      }
-      if (!$busy_drawing) {$busy_drawing=1; draw(); $busy_drawing=0}
-    }
-    return 1;
-  }
-);
-Gtk2->main;
-turn_off_sound_input();
-exit(0);
-# -----------------------------------------------------------------------------------------------------------------
-#           sound-collecting code
-# -----------------------------------------------------------------------------------------------------------------
-sub turn_off_sound_input {
-  Glib::Source->remove($event_source_tag);
-  close_sound_input($dsp);
-}
 
-sub collect_sound {
+sub accept_sound_from_child {
+  my $stamp = shift;
   my @data;
   my $buff;
   my $template;
@@ -189,12 +242,54 @@ sub collect_sound {
   if ($sample_size_bytes==4) {$template = "N$small_buff_size"}
   if (!defined $template) {return "illegal sample size, $sample_size_bytes bytes"}
   my $nbytes = $small_buff_size*$sample_size_bytes;
-  my $nread = read($dsp,$buff,$nbytes);
-  #print "nbytes=$nbytes, nread=$nread\n";
+  my $n = ($stamp % 2);
+  my $sound_file = $tmp_file_prefix . "b" . $n;
+  open(F,"<$sound_file") or return "error opening $sound_file for input, $!";
+  my $nread = read(F,$buff,$nbytes);
+  close F;
+  if ($nread != $nbytes) {return "read $nread bytes from $sound_file, expected $nbytes"}
+  #print "nbytes=$nbytes, nread=$nread\n"; #qwe
   @sound_data = unpack($template,$buff);
+  #print "size of sound data = ".(@sound_data+0)."\n"; # qwe
   put_new_data_in_circular_buffer();
   return 0;
 }
+
+my $last_stamp = -1;
+my $source_id = Glib::Timeout::add(
+    0, # priority
+    100, # milliseconds
+    sub{
+      if (-e $child_error_file) {
+        open(F,"<$child_error_file") or die "error opening child error file for input, $!";
+        my $message = <F>;
+        close F;
+        print STDERR $message,"\n";
+        clean_up();
+        exit(-1);
+      }
+      if ($go && open(F,"<$pointer_file")) {
+        my $current_stamp = <F>+0;
+        close F;
+        if ($current_stamp>$last_stamp) {
+          #print "$current_stamp is available\n";
+          my $err = accept_sound_from_child($current_stamp);
+          if ($err) {die $err}
+          $last_stamp = $current_stamp;
+          if ($mode eq 'f') {
+            my $fft = do_fft(\@big_buff);
+            $spectrum = $fft->spctrm() if defined $fft; # $spectrum has $big_buff_size/2+1 elements
+          }
+          if (!$busy_drawing) {$busy_drawing=1; draw(); $busy_drawing=0}
+        }
+      }
+      return 1;
+    }
+);
+
+Gtk2->main;
+turn_off_sound_input();
+exit(0);
 
 # -----------------------------------------------------------------------------------------------------------------
 #          drawing
@@ -672,10 +767,10 @@ my @buttons = (
   ['Freeze/Go', \$general_buttons_hbox, sub {
     $go = !$go;
     if (!$go) {
-      close_sound_input($dsp);
+      turn_off_sound_input();
     }
     else {
-      start_sound_input();
+      turn_on_sound_input();
     }
   }],
   ['Frequency/Time' , \$x_buttons_hbox, sub {
