@@ -72,6 +72,7 @@ use Gtk2 -init;
 use IO::File;
 use Fcntl qw(:DEFAULT :flock);
 use Time::HiRes;
+use POSIX ":sys_wait_h";
 
 # Notes on moving average:
 #   Looking at fftexplorer's source code, it looks like it simply averages the complex amplitudes of n frames.
@@ -163,8 +164,9 @@ clean_up();
 my $pid = fork; # camel book, p. 715
 my $fork_error  = (!defined $pid);
 my $i_am_child = !($pid || $fork_error);
+my $child_pid = ($i_am_child ? $$ : $pid);
 
-#print "parent_pid=$parent_pid, i_am_child=$i_am_child\n";
+#print "parent_pid=$parent_pid, child_pid=$child_pid, i_am_child=$i_am_child, my PID=$$\n";
 
 # -----------------------------------------------------------------------------------------------------------------
 #          be the sound-collecting process
@@ -187,8 +189,12 @@ if ($i_am_child) {
 
   my $stamp = -1;
   for (;;) {
-      if (-e $stop_file) {
+      my $parent_is_dead = !(kill 0,$parent_pid);
+      if (-e $stop_file || $parent_is_dead) {
         close_sound_input($dsp);
+      }
+      exit(0) if $parent_is_dead;
+      if (-e $stop_file) {
         while (-e $stop_file) {sleep .3}
         start_sound_input();
       }
@@ -257,16 +263,23 @@ sub accept_sound_from_child {
   return 0;
 }
 
+my $child_dead = 0;
+$SIG{CHLD} = sub {$child_dead = 1};
+
 my $last_stamp = -1;
 my $source_id = Glib::Timeout::add(
     0, # priority
     100, # milliseconds
     sub{
-      if (-e $child_error_file) {
-        open(F,"<$child_error_file") or die "error opening child error file for input, $!";
-        my $message = <F>;
-        close F;
-        print STDERR $message,"\n";
+      my $child_error = -e $child_error_file;
+      if ($child_dead || $child_error) {
+        if ($child_error) {
+          open(F,"<$child_error_file") or die "error opening child error file for input, $!";
+          my $message = <F>;
+          close F;
+          print STDERR $message,"\n";
+        }
+        print STDERR "sound-collecting process died unexpectedly\n" if $child_dead;
         clean_up();
         exit(-1);
       }
@@ -291,6 +304,8 @@ my $source_id = Glib::Timeout::add(
 
 Gtk2->main;
 turn_off_sound_input();
+kill 'KILL',$child_pid;
+waitpid($child_pid,&WNOHANG);
 exit(0);
 
 # -----------------------------------------------------------------------------------------------------------------
